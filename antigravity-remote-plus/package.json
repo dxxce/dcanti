@@ -1,0 +1,137 @@
+{
+  "name": "antigravity-remote-plus",
+  "displayName": "Antigravity Remote Plus",
+  "description": "Remote control for Antigravity IDE: web UI + Telegram. Chat history, new chat, realtime messaging, send files/images, revert, model picker, quota, file & GitHub control.",
+  "version": "0.1.0",
+  "publisher": "deece",
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Productivity",
+    "Machine Learning",
+    "Chat"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravityRemotePlus.start",
+        "title": "Start Remote Server",
+        "category": "Antigravity Remote Plus"
+      },
+      {
+        "command": "antigravityRemotePlus.stop",
+        "title": "Stop Remote Server",
+        "category": "Antigravity Remote Plus"
+      },
+      {
+        "command": "antigravityRemotePlus.openWeb",
+        "title": "Open Web UI",
+        "category": "Antigravity Remote Plus"
+      },
+      {
+        "command": "antigravityRemotePlus.showInfo",
+        "title": "Show Connection Info",
+        "category": "Antigravity Remote Plus"
+      },
+      {
+        "command": "antigravityRemotePlus.toggle",
+        "title": "Toggle Remote Server (on/off)",
+        "category": "Antigravity Remote Plus"
+      },
+      {
+        "command": "antigravityRemotePlus.relaunchWithRemoteDebug",
+        "title": "Relaunch IDE with Remote Debugging (sync web ⇄ IDE)",
+        "category": "Antigravity Remote Plus"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Remote Plus",
+      "properties": {
+        "antigravityRemotePlus.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the remote server when the IDE opens",
+          "order": 0
+        },
+        "antigravityRemotePlus.port": {
+          "type": "number",
+          "default": 7377,
+          "description": "Local HTTP port for the web UI + API server",
+          "order": 1
+        },
+        "antigravityRemotePlus.bindHost": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "enum": ["127.0.0.1", "0.0.0.0"],
+          "enumDescriptions": [
+            "Localhost only (safest)",
+            "All interfaces (LAN/internet — requires password)"
+          ],
+          "description": "Network interface to bind the server to",
+          "order": 2
+        },
+        "antigravityRemotePlus.password": {
+          "type": "string",
+          "default": "Maiyeu3m",
+          "description": "Password required to access the web UI and API",
+          "order": 3
+        },
+        "antigravityRemotePlus.telegramEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the Telegram bot bridge",
+          "order": 4
+        },
+        "antigravityRemotePlus.telegramToken": {
+          "type": "string",
+          "default": "",
+          "description": "Telegram bot token (from @BotFather)",
+          "order": 5
+        },
+        "antigravityRemotePlus.telegramChatId": {
+          "type": "string",
+          "default": "",
+          "description": "Allowed Telegram chat ID (only this chat can control the IDE)",
+          "order": 6
+        },
+        "antigravityRemotePlus.remoteDebugPort": {
+          "type": "number",
+          "default": 9222,
+          "description": "Remote debugging (CDP) port used to sync the IDE chat panel with the web UI. The IDE must be launched with --remote-debugging-port set to this value; use the 'Relaunch IDE with Remote Debugging' command.",
+          "order": 7
+        },
+        "antigravityRemotePlus.workspaceRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Folder that contains your project folders (e.g. /Users/you/Documents). The web UI lists its subfolders as quick 'open workspace' choices.",
+          "order": 8
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:web": "cd web && pnpm run build",
+    "build:ext": "node esbuild.js",
+    "build": "pnpm run build:web && pnpm run build:ext",
+    "watch": "node esbuild.js --watch",
+    "package": "pnpm run build && npx @vscode/vsce package --no-dependencies -o antigravity-remote-plus.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "ws": "^8.16.0"
+  }
+}

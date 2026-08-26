@@ -1,0 +1,15 @@
+# Source & build tooling — the bundled out/extension.js is all we ship.
+src/**
+web/**
+esbuild.js
+tsconfig.json
+.gitignore
+**/*.map
+**/*.ts
+
+# Dev dependencies / metadata
+node_modules/**
+.vscode/**
+scratch/**
+
+# Keep: out/**, media/**, icon.png, package.json, README, LICENSE
