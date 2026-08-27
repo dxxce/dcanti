@@ -1,12 +1,15 @@
 // Antigravity Remote Plus — extension entry point.
 //
-// On activation we:
-//   * create the LS client + chat controller (the AI bridge)
-//   * start the local web/API server (password-protected)
-//   * optionally start the Telegram bridge
-// and expose start/stop/openWeb/showInfo commands + a status bar item.
+// Supports single shared server across all open Antigravity IDE instances:
+//   * The first IDE instance acts as the Primary Host on port 7377.
+//   * Subsequent IDE instances detect the running server and connect as
+//     Secondary Nodes over an internal authenticated WebSocket.
+//   * Failover / Leader election: If the Host window closes, a Secondary
+//     instance automatically assumes the Host role.
 
 import * as vscode from "vscode";
+import * as http from "http";
+import * as crypto from "crypto";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
@@ -14,6 +17,9 @@ import { LsClient } from "./lsClient";
 import { ChatController } from "./chatController";
 import { RemoteServer } from "./server";
 import { TelegramBridge } from "./telegram";
+import { TerminalController } from "./terminalController";
+import { WindowClient } from "./windowClient";
+import { IdeWindowInfo } from "./windowTypes";
 
 const CFG = "antigravityRemotePlus";
 
@@ -23,8 +29,14 @@ let statusBar: vscode.StatusBarItem;
 let ls: LsClient | null = null;
 let chat: ChatController | null = null;
 let server: RemoteServer | null = null;
+let client: WindowClient | null = null;
+let terminals: TerminalController | null = null;
 let telegram: TelegramBridge | null = null;
 let running = false;
+let isHost = false;
+
+// Persistent unique ID for this IDE window instance
+const windowId = `win_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -44,6 +56,49 @@ function lanIps(): string[] {
     }
   }
   return ips;
+}
+
+function getLocalWindowInfo(): IdeWindowInfo {
+  const wsFolders = (vscode.workspace.workspaceFolders || []).map((f) => ({
+    name: f.name,
+    path: f.uri.fsPath,
+  }));
+  const wsName = vscode.workspace.name || wsFolders[0]?.name || "Workspace";
+  const wsPath = wsFolders[0]?.path || null;
+
+  return {
+    id: windowId,
+    title: wsName,
+    workspaceName: wsName,
+    workspacePath: wsPath,
+    workspaceFolders: wsFolders,
+    isGenerating: false,
+    statusText: "Idle",
+    pid: process.pid,
+    isHost: false,
+    lastActive: Date.now(),
+  };
+}
+
+function checkServerHealth(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get(
+      `http://127.0.0.1:${port}/api/health`,
+      { timeout: 600 },
+      (res) => {
+        if (res.statusCode === 200) {
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
 }
 
 async function startAll(context: vscode.ExtensionContext) {
@@ -68,9 +123,7 @@ async function startAll(context: vscode.ExtensionContext) {
   chat.start();
   await chat.resolveActiveCascadeId();
 
-  // Try to attach to the IDE's remote-debugging port so the web UI and the IDE
-  // chat panel stay in sync (both usable at once). Non-fatal if unavailable —
-  // we transparently fall back to VS Code commands + the LS trajectory.
+  // Try to attach to the IDE's remote-debugging port
   const debugPort = cfg<number>("remoteDebugPort", 9222);
   const cdpOk = await chat.connectCdp(debugPort);
   if (!cdpOk) {
@@ -80,82 +133,153 @@ async function startAll(context: vscode.ExtensionContext) {
     );
   }
 
-  const webRoot = path.join(context.extensionPath, "media", "web");
-  server = new RemoteServer(
+  const windowInfo = getLocalWindowInfo();
+
+  // Check if a Primary Host is already running on port
+  const isServerRunning = await checkServerHealth(port);
+
+  if (!isServerRunning) {
+    // ---- MODE A: Primary Host ----
+    log(`[ext] starting as Primary Host on port ${port}…`);
+    windowInfo.isHost = true;
+    const webRoot = path.join(context.extensionPath, "media", "web");
+
+    server = new RemoteServer(
+      {
+        port,
+        host,
+        password,
+        webRoot,
+        log,
+        onSettingsChanged: () => {
+          log("[ext] settings changed via web UI — restarting…");
+          setTimeout(() => {
+            stopAll();
+            startAll(context).catch((e) =>
+              log(`[ext] restart after settings change: ${e}`)
+            );
+          }, 400);
+        },
+      },
+      chat,
+      windowInfo
+    );
+
+    try {
+      await server.start();
+      isHost = true;
+      running = true;
+    } catch (e: any) {
+      log(`[ext] host server start failed: ${e?.message ?? e}`);
+      server = null;
+      // Fallback check if another window won the race
+      const fallbackRunning = await checkServerHealth(port);
+      if (fallbackRunning) {
+        log("[ext] another instance bound the port; falling back to Secondary client");
+        await startSecondary(port, host, password, windowInfo, context);
+        return;
+      }
+      chat.stop();
+      running = false;
+      isHost = false;
+      updateStatusBar();
+      vscode.window.showErrorMessage(`Failed to start server on ${host}:${port} — ${e?.message ?? e}`);
+      return;
+    }
+
+    // Telegram (optional on Host).
+    if (cfg<boolean>("telegramEnabled", false)) {
+      const token = cfg<string>("telegramToken", "");
+      const chatId = cfg<string>("telegramChatId", "");
+      if (token) {
+        telegram = new TelegramBridge({ token, chatId, log }, chat);
+        await telegram.start();
+      } else {
+        log("[ext] telegram enabled but no token set");
+      }
+    }
+
+    updateStatusBar();
+    const activePort = server.activePort;
+    const lan = host === "0.0.0.0" ? lanIps() : [];
+    const urls = [
+      `http://127.0.0.1:${activePort}`,
+      ...lan.map((ip) => `http://${ip}:${activePort}`),
+    ];
+    log(`[ext] Host started. URLs: ${urls.join(", ")}`);
+    const primary = lan.length > 0 ? `http://${lan[0]}:${activePort}` : urls[0];
+    const msg =
+      lan.length > 0
+        ? `Antigravity Remote Plus [Host] on LAN: ${primary}`
+        : `Antigravity Remote Plus [Host] running on ${primary}`;
+    const actions = lan.length > 0 ? ["Open Web UI", "Copy LAN URL"] : ["Open Web UI"];
+    vscode.window.showInformationMessage(msg, ...actions).then((choice) => {
+      if (choice === "Open Web UI") openWeb();
+      else if (choice === "Copy LAN URL") {
+        vscode.env.clipboard.writeText(primary);
+        vscode.window.showInformationMessage(`Copied: ${primary}`);
+      }
+    });
+  } else {
+    // ---- MODE B: Secondary Client ----
+    await startSecondary(port, host, password, windowInfo, context);
+  }
+}
+
+async function startSecondary(
+  port: number,
+  host: string,
+  password: string,
+  windowInfo: IdeWindowInfo,
+  context: vscode.ExtensionContext
+) {
+  log(`[ext] existing Host detected on port ${port}; connecting as Secondary Node…`);
+  const token = crypto
+    .createHmac("sha256", "antigravity-remote-plus/v1")
+    .update(password)
+    .digest("hex");
+
+  terminals = new TerminalController(log, () => {});
+
+  client = new WindowClient(
     {
       port,
       host,
-      password,
-      webRoot,
+      token,
+      windowInfo,
       log,
-      // When settings change via the web UI, restart everything so the new
-      // port/password/host/telegram config takes effect immediately.
-      onSettingsChanged: () => {
-        log("[ext] settings changed via web UI — restarting…");
-        // Defer so the HTTP response for the settings PUT flushes first.
-        setTimeout(() => {
+      onHostDisconnected: () => {
+        log("[ext] Host disconnected — preparing failover election…");
+        if (running && !isHost) {
           stopAll();
-          startAll(context).catch((e) =>
-            log(`[ext] restart after settings change: ${e}`)
-          );
-        }, 400);
+          // Jittered backoff to avoid thundering herd on failover
+          const delay = 300 + Math.floor(Math.random() * 600);
+          setTimeout(() => {
+            startAll(context).catch((e) => log(`[ext] failover start: ${e}`));
+          }, delay);
+        }
       },
     },
-    chat
+    chat!,
+    terminals
   );
+
   try {
-    await server.start();
-  } catch (e: any) {
-    vscode.window.showErrorMessage(
-      `Failed to start server on ${host}:${port} — ${e?.message ?? e}`
+    await client.connect();
+    isHost = false;
+    running = true;
+    updateStatusBar();
+    log(`[ext] Secondary connected successfully to Host (windowId=${windowInfo.id})`);
+    vscode.window.showInformationMessage(
+      `Antigravity Remote Plus: Connected to Host server on port ${port} (${windowInfo.title})`
     );
-    log(`[ext] server start failed: ${e?.message ?? e}`);
-    server = null;
-    chat.stop();
+  } catch (e: any) {
+    log(`[ext] failed to connect to Host: ${e?.message ?? e}`);
+    client = null;
+    chat?.stop();
     running = false;
     updateStatusBar();
-    return;
   }
-
-  // Telegram (optional).
-  if (cfg<boolean>("telegramEnabled", false)) {
-    const token = cfg<string>("telegramToken", "");
-    const chatId = cfg<string>("telegramChatId", "");
-    if (token) {
-      telegram = new TelegramBridge({ token, chatId, log }, chat);
-      await telegram.start();
-    } else {
-      log("[ext] telegram enabled but no token set");
-    }
-  }
-
-  running = true;
-  updateStatusBar();
-  const activePort = server.activePort;
-  if (activePort !== port) {
-    log(`[ext] requested port ${port} was busy; bound to ${activePort} instead`);
-  }
-  const lan = host === "0.0.0.0" ? lanIps() : [];
-  const urls = [
-    `http://127.0.0.1:${activePort}`,
-    ...lan.map((ip) => `http://${ip}:${activePort}`),
-  ];
-  log(`[ext] started. URLs: ${urls.join(", ")}`);
-  // Prefer showing the LAN URL so other machines on the network know the
-  // address to open (e.g. http://192.168.1.x:7377). Falls back to localhost.
-  const primary = lan.length > 0 ? `http://${lan[0]}:${activePort}` : urls[0];
-  const msg =
-    lan.length > 0
-      ? `Antigravity Remote Plus on LAN: ${primary}  (password required)`
-      : `Antigravity Remote Plus running on ${primary}`;
-  const actions = lan.length > 0 ? ["Open Web UI", "Copy LAN URL"] : ["Open Web UI"];
-  vscode.window.showInformationMessage(msg, ...actions).then((choice) => {
-    if (choice === "Open Web UI") openWeb();
-    else if (choice === "Copy LAN URL") {
-      vscode.env.clipboard.writeText(primary);
-      vscode.window.showInformationMessage(`Copied: ${primary}`);
-    }
-  });
 }
 
 function stopAll() {
@@ -163,10 +287,13 @@ function stopAll() {
   telegram = null;
   server?.stop();
   server = null;
+  client?.stop();
+  client = null;
   chat?.stop();
   chat = null;
   ls = null;
   running = false;
+  isHost = false;
   updateStatusBar();
   log("[ext] stopped");
 }
@@ -183,8 +310,9 @@ function showInfo() {
     `http://127.0.0.1:${port}`,
     ...(host === "0.0.0.0" ? lanIps().map((ip) => `http://${ip}:${port}`) : []),
   ];
+  const role = isHost ? "Host Server" : "Connected Client";
   vscode.window.showInformationMessage(
-    `${running ? "Running" : "Stopped"} — ${urls.join("  ")} (password protected)`
+    `${running ? `Running (${role})` : "Stopped"} — ${urls.join("  ")}`
   );
 }
 
@@ -202,13 +330,11 @@ async function relaunchWithRemoteDebug() {
     "Relaunch"
   );
   if (choice !== "Relaunch") return;
-  // Persist the flag into argv.json so the port survives the reload.
   try {
     const argvPath = path.join(os.homedir(), ".antigravity-ide", "argv.json");
     let argv: any = {};
     if (fs.existsSync(argvPath)) {
       const raw = fs.readFileSync(argvPath, "utf8").replace(/^﻿/, "");
-      // argv.json allows // comments; strip them before parsing.
       const stripped = raw.replace(/^\s*\/\/.*$/gm, "");
       try {
         argv = JSON.parse(stripped);
@@ -231,17 +357,19 @@ async function relaunchWithRemoteDebug() {
 
 function updateStatusBar() {
   if (!statusBar) return;
-  const sync = running && chat?.cdpConnected() ? " $(link)" : "";
-  statusBar.text = running
-    ? `$(radio-tower) Remote+${sync}`
-    : "$(circle-slash) Remote+";
-  statusBar.tooltip = running
-    ? `Antigravity Remote Plus: running${
-        chat?.cdpConnected()
-          ? ` (IDE⇄web synced on CDP port ${chat.cdpPort()})`
-          : " (CDP not attached — command fallback)"
-      }\nClick to stop.`
-    : "Antigravity Remote Plus: stopped — click to start";
+  if (running) {
+    if (isHost) {
+      const sync = chat?.cdpConnected() ? " $(link)" : "";
+      statusBar.text = `$(radio-tower) Remote+ [Host: ${server?.activePort}]${sync}`;
+      statusBar.tooltip = `Antigravity Remote Plus: Host on port ${server?.activePort}\nClick to stop.`;
+    } else {
+      statusBar.text = `$(link) Remote+ [Connected]`;
+      statusBar.tooltip = `Antigravity Remote Plus: Connected to shared server\nClick to stop.`;
+    }
+  } else {
+    statusBar.text = "$(circle-slash) Remote+";
+    statusBar.tooltip = "Antigravity Remote Plus: stopped — click to start";
+  }
   statusBar.command = "antigravityRemotePlus.toggle";
   statusBar.show();
 }
@@ -274,8 +402,7 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   if (cfg<boolean>("autoStart", true)) {
-    // Defer slightly so the LS process is up.
-    setTimeout(() => startAll(context).catch((e) => log(`[ext] autostart: ${e}`)), 2500);
+    setTimeout(() => startAll(context).catch((e) => log(`[ext] autostart: ${e}`)), 2000);
   }
 }
 

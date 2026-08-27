@@ -294,6 +294,7 @@ export function ChatPanel({
   };
 
   const [localSelectedId, setLocalSelectedId] = useState<string | null>(null);
+  const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
 
   const selectedModel =
     (localSelectedId ? models.find((m) => m.id === localSelectedId || m.label === localSelectedId) : null) ??
@@ -301,9 +302,19 @@ export function ChatPanel({
     models.find((m) => m.recommended) ??
     models[0];
 
+  const modelGroups = useMemo(
+    () => groupModels(models, selectedModel?.id || localSelectedId || undefined),
+    [models, selectedModel, localSelectedId]
+  );
+
+  const activeGroup = useMemo(
+    () => modelGroups.find((g) => g.key === activeGroupKey) || null,
+    [modelGroups, activeGroupKey]
+  );
+
   const cleanModelName = (name: string) => {
     if (!name) return "";
-    return name.replace(/^(Gemini\s*|Claude\s*|GPT-\s*)/i, '').trim();
+    return name.replace(/^MODEL_PLACEHOLDER_/, "").trim();
   };
 
   // Plan approval: last assistant message asks to confirm a plan, or a dedicated
@@ -383,7 +394,6 @@ export function ChatPanel({
               </div>
             )}
         </div>
-
       </div>
 
       <div className="composer">
@@ -444,44 +454,155 @@ export function ChatPanel({
                 </button>
                 {modelOpen && (
                   <>
-                    <div className="picker-backdrop" onClick={() => setModelOpen(false)} />
+                    <div
+                      className="picker-backdrop"
+                      onClick={() => {
+                        setModelOpen(false);
+                        setActiveGroupKey(null);
+                      }}
+                    />
                     <div className="model-menu">
-                      <div className="model-menu-title">Model &amp; quota</div>
-                      {models.length === 0 && (
+                      <div className="model-menu-title">Model &amp; Quota</div>
+                      {modelGroups.length === 0 && (
                         <div className="muted pad">Không có model.</div>
                       )}
-                      {models.map((m) => (
-                        <button
-                          key={m.id}
-                          className={"model-item" + ((m.id === selectedModel?.id || m.selected) ? " active" : "")}
-                          onClick={() => {
-                            setLocalSelectedId(m.id);
-                            onSelectModel(m.id);
-                            setModelOpen(false);
-                          }}
-                        >
-                          <span className="model-item-main">
-                            <span className="model-item-name">
-                              {m.selected && <Icon name="check" size={13} />}
-                              {cleanModelName(m.label)}
-                            </span>
-                            {m.remainingFraction != null && (
-                              <span className="model-item-meter">
-                                <i
-                                  style={{
-                                    width: `${Math.round(m.remainingFraction * 100)}%`,
-                                  }}
-                                />
-                              </span>
+                      {modelGroups.map((g) => {
+                        const hasSub = g.variants.length > 1;
+                        const isExpanded = activeGroupKey === g.key;
+                        const pct =
+                          g.remainingFraction != null
+                            ? Math.round(g.remainingFraction * 100)
+                            : null;
+
+                        return (
+                          <div key={g.key} className="model-group-wrapper">
+                            <button
+                              type="button"
+                              className={
+                                "model-item" +
+                                (g.isSelected ? " active" : "") +
+                                (isExpanded ? " expanded" : "")
+                              }
+                              onClick={() => {
+                                if (hasSub) {
+                                  setActiveGroupKey((prev) =>
+                                    prev === g.key ? null : g.key
+                                  );
+                                } else {
+                                  const single = g.variants[0];
+                                  setLocalSelectedId(single.id);
+                                  onSelectModel(single.id);
+                                  setModelOpen(false);
+                                  setActiveGroupKey(null);
+                                }
+                              }}
+                            >
+                              <div className="model-item-left">
+                                <span className="model-item-name">{g.title}</span>
+                                {g.levelSuffix && (
+                                  <span className="model-item-level">{g.levelSuffix}</span>
+                                )}
+                              </div>
+                              <div className="model-item-right">
+                                {g.isFast && (
+                                  <span
+                                    className="model-badge-fast"
+                                    title="Mô hình tốc độ cao"
+                                  >
+                                    Fast <span className="fast-info-glyph">ⓘ</span>
+                                  </span>
+                                )}
+                                {pct != null && (
+                                  <span
+                                    className={
+                                      "model-quota-tag " +
+                                      quotaClass(g.remainingFraction ?? 1)
+                                    }
+                                  >
+                                    {pct}%
+                                  </span>
+                                )}
+                                {hasSub ? (
+                                  <Icon
+                                    name="chevronDown"
+                                    size={13}
+                                    className={
+                                      "model-chevron" + (isExpanded ? " rotated" : "")
+                                    }
+                                  />
+                                ) : (
+                                  g.isSelected && (
+                                    <Icon
+                                      name="check"
+                                      size={13}
+                                      className="model-check-icon"
+                                    />
+                                  )
+                                )}
+                              </div>
+                            </button>
+
+                            {/* Sublevels Accordion List directly below this model */}
+                            {hasSub && isExpanded && (
+                              <div className="model-inline-sublevels">
+                                {g.variants.map((v) => {
+                                  const isVariantSelected =
+                                    v.id === selectedModel?.id ||
+                                    v.id === localSelectedId ||
+                                    v.selected;
+                                  const vPct =
+                                    v.remainingFraction != null
+                                      ? Math.round(v.remainingFraction * 100)
+                                      : null;
+                                  return (
+                                    <button
+                                      key={v.id}
+                                      type="button"
+                                      className={
+                                        "model-sublevel-item" +
+                                        (isVariantSelected ? " active" : "")
+                                      }
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setLocalSelectedId(v.id);
+                                        onSelectModel(v.id);
+                                        setModelOpen(false);
+                                        setActiveGroupKey(null);
+                                      }}
+                                    >
+                                      <div className="sublevel-left">
+                                        <span className="sublevel-dot" />
+                                        <span className="sublevel-title">
+                                          {v.level || v.label}
+                                        </span>
+                                      </div>
+                                      <div className="sublevel-right">
+                                        {vPct != null && (
+                                          <span
+                                            className={
+                                              "model-quota-tag " +
+                                              quotaClass(v.remainingFraction ?? 1)
+                                            }
+                                          >
+                                            {vPct}%
+                                          </span>
+                                        )}
+                                        {isVariantSelected && (
+                                          <Icon
+                                            name="check"
+                                            size={13}
+                                            className="sublevel-check"
+                                          />
+                                        )}
+                                      </div>
+                                    </button>
+                                  );
+                                })}
+                              </div>
                             )}
-                          </span>
-                          {m.remainingFraction != null && (
-                            <span className="model-quota-mini">
-                              {Math.round(m.remainingFraction * 100)}%
-                            </span>
-                          )}
-                        </button>
-                      ))}
+                          </div>
+                        );
+                      })}
                     </div>
                   </>
                 )}
@@ -656,11 +777,141 @@ export function ChatPanel({
 
 // Map a remaining-quota fraction (0..1) to a color bucket: green when plenty
 // left, amber when getting low, red when nearly exhausted.
+interface ModelVariant {
+  id: string;
+  label: string;
+  level: string;
+  selected: boolean;
+  remainingFraction?: number;
+  resetTime?: string;
+}
+
+interface ModelGroup {
+  key: string;
+  title: string;
+  levelSuffix: string;
+  isFast: boolean;
+  variants: ModelVariant[];
+  selectedVariant: ModelVariant;
+  isSelected: boolean;
+  remainingFraction?: number;
+}
+
+function groupModels(list: ModelInfo[], selectedId?: string): ModelGroup[] {
+  if (!list || list.length === 0) return [];
+
+  const map = new Map<string, { title: string; isFast: boolean; variants: ModelVariant[] }>();
+
+  for (const m of list) {
+    const raw = (m.label || "").replace(/^MODEL_PLACEHOLDER_/, "").trim();
+    let base = raw;
+    let level = "";
+    let isFast = false;
+
+    if (/flash/i.test(raw)) {
+      isFast = true;
+    }
+
+    const levelMatch =
+      raw.match(/\((High|Medium|Low)\)/i) || raw.match(/\b(High|Medium|Low)\b/i);
+    if (levelMatch) {
+      level = levelMatch[1].charAt(0).toUpperCase() + levelMatch[1].slice(1).toLowerCase();
+      base = raw
+        .replace(/\((High|Medium|Low)\)/i, "")
+        .replace(/\b(High|Medium|Low)\b/i, "")
+        .trim();
+    }
+
+    if (!map.has(base)) {
+      map.set(base, { title: base, isFast, variants: [] });
+    }
+
+    const isSel = Boolean(
+      m.selected || (selectedId && (m.id === selectedId || m.label === selectedId))
+    );
+    map.get(base)!.variants.push({
+      id: m.id,
+      label: m.label,
+      level: level || "",
+      selected: isSel,
+      remainingFraction: m.remainingFraction,
+      resetTime: m.resetTime,
+    });
+  }
+
+  const ORDER = [
+    "Gemini 3.7 Flash",
+    "Gemini 3.6 Flash",
+    "Gemini 3.5 Flash",
+    "Gemini 3.1 Pro",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
+  ];
+
+  const groups: ModelGroup[] = [];
+
+  for (const [key, val] of map.entries()) {
+    const levelRank: Record<string, number> = { High: 1, Medium: 2, Low: 3, "": 4 };
+    val.variants.sort((a, b) => (levelRank[a.level] || 9) - (levelRank[b.level] || 9));
+
+    const sel = val.variants.find((v) => v.selected) || val.variants[0];
+    const isSelected = val.variants.some((v) => v.selected);
+    const fraction =
+      sel.remainingFraction ??
+      val.variants.find((v) => v.remainingFraction != null)?.remainingFraction;
+
+    groups.push({
+      key,
+      title: val.title,
+      levelSuffix: sel.level || "",
+      isFast: val.isFast,
+      variants: val.variants,
+      selectedVariant: sel,
+      isSelected,
+      remainingFraction: fraction,
+    });
+  }
+
+  groups.sort((a, b) => {
+    const idxA = ORDER.indexOf(a.title);
+    const idxB = ORDER.indexOf(b.title);
+    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+    if (idxA !== -1) return -1;
+    if (idxB !== -1) return 1;
+    return a.title.localeCompare(b.title);
+  });
+
+  return groups;
+}
+
 function quotaClass(fraction: number): string {
   const pct = fraction * 100;
   if (pct >= 50) return "q-good";
   if (pct >= 20) return "q-warn";
   return "q-low";
+}
+
+function parseModelInfo(label: string) {
+  let raw = label.replace(/^MODEL_PLACEHOLDER_/, "").trim();
+
+  let isFast = false;
+  if (/flash/i.test(raw)) {
+    isFast = true;
+  }
+
+  let level = "";
+  const m = raw.match(/\b(High|Medium|Low)\b/i) || raw.match(/\((High|Medium|Low)\)/i);
+  if (m) {
+    level = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+    raw = raw.replace(/\((High|Medium|Low)\)/i, "").replace(/\b(High|Medium|Low)\b/i, "").trim();
+  }
+
+  return {
+    title: raw,
+    level,
+    isFast,
+  };
 }
 
 function isPlanPrompt(text: string): boolean {

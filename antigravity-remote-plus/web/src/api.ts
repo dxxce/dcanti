@@ -4,9 +4,14 @@
 
 const TOKEN_KEY = "arp_token";
 
+let currentWindowId: string | null = null;
+
 function authHeaders(): Record<string, string> {
   const t = localStorage.getItem(TOKEN_KEY);
-  return t ? { Authorization: `Bearer ${t}` } : {};
+  const headers: Record<string, string> = {};
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+  if (currentWindowId) headers["x-window-id"] = currentWindowId;
+  return headers;
 }
 
 async function req<T>(
@@ -38,8 +43,22 @@ export class UnauthorizedError extends Error {
   }
 }
 
+export interface IdeWindowInfo {
+  id: string;
+  title: string;
+  workspaceName: string;
+  workspacePath: string | null;
+  workspaceFolders: Array<{ name: string; path: string }>;
+  isGenerating: boolean;
+  statusText: string;
+  activeCascadeId?: string;
+  pid?: number;
+  isHost: boolean;
+  lastActive: number;
+}
+
 export interface ChatMessage {
-  role: "user" | "assistant" | "tool" | "system" | "plan";
+  role: "user" | "assistant" | "tool" | "system" | "plan" | "ask" | "artifact";
   text: string;
   ts?: number;
   // Tool rows carry a coarse kind (for icon/grouping) + optional short detail.
@@ -47,6 +66,13 @@ export interface ChatMessage {
   detail?: string;
   // User messages carry their trajectory stepIndex for per-message revert.
   stepIndex?: number;
+  questions?: Array<{
+    question: string;
+    options: Array<{ id: string; text: string }>;
+    selectedOptionIds?: string[];
+    skipped?: boolean;
+  }>;
+  answered?: boolean;
   meta?: Record<string, unknown>;
 }
 
@@ -129,8 +155,6 @@ export interface TerminalInfo {
 }
 
 export interface SlashCommand {
-  // The LS returns the command's identity nested under `info`, plus a
-  // human-facing title/description alongside it.
   info?: { name?: string; modelFacingText?: string; type?: string };
   title?: string;
   description?: string;
@@ -167,6 +191,13 @@ export interface BrowseResult {
 }
 
 export const api = {
+  setWindowId(id: string | null) {
+    currentWindowId = id;
+  },
+  getWindowId(): string | null {
+    return currentWindowId;
+  },
+
   async login(password: string): Promise<boolean> {
     const res = await fetch("/api/login", {
       method: "POST",
@@ -179,6 +210,8 @@ export const api = {
     if (data.token) localStorage.setItem(TOKEN_KEY, data.token);
     return Boolean(data.ok);
   },
+
+  windows: () => req<{ windows: IdeWindowInfo[] }>("windows"),
 
   state: (cascadeId?: string) =>
     req<ChatState>(`state${cascadeId ? `?cascadeId=${encodeURIComponent(cascadeId)}` : ""}`),
@@ -214,7 +247,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ stepIndex }),
     }),
-  // Answer / skip an ask_question interaction so the paused agent resumes.
   answerQuestion: (
     stepIndex: number,
     answers: { selectedOptionIds: string[]; freeText?: string }[]
@@ -228,9 +260,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ stepIndex }),
     }),
-  // Dynamic slash-command catalog for the active cascade.
   slashCommands: () => req<{ commands: SlashCommand[] }>("slash-commands"),
-  // Approve / reject a plan artifact (implementation_plan.md …).
   approvePlan: (artifactUri: string, approved: boolean) =>
     req<{ ok: boolean }>("approve-plan", {
       method: "POST",
@@ -252,11 +282,9 @@ export const api = {
     }),
   openFile: (path: string) =>
     req<{ ok: boolean }>("file-open", { method: "POST", body: JSON.stringify({ path }) }),
-  // Upload files; the server saves them into the workspace and returns both the
-  // workspace-relative paths and the absolute paths (so the caller can attach
-  // an @absolute-path the agent can actually read).
   upload: (files: File[] | FileList) => {
     const fd = new FormData();
+    if (currentWindowId) fd.append("windowId", currentWindowId);
     for (const f of Array.from(files)) fd.append("file", f, f.name);
     return req<{ saved: string[]; absPaths: string[] }>("upload", {
       method: "POST",

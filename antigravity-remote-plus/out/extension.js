@@ -2310,12 +2310,12 @@ var require_websocket = __commonJS({
     "use strict";
     var EventEmitter = require("events");
     var https3 = require("https");
-    var http4 = require("http");
+    var http5 = require("http");
     var net = require("net");
     var tls = require("tls");
     var { randomBytes, createHash } = require("crypto");
     var { Duplex, Readable } = require("stream");
-    var { URL: URL2 } = require("url");
+    var { URL: URL3 } = require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
     var Receiver2 = require_receiver();
     var Sender2 = require_sender();
@@ -2833,11 +2833,11 @@ var require_websocket = __commonJS({
         );
       }
       let parsedUrl;
-      if (address instanceof URL2) {
+      if (address instanceof URL3) {
         parsedUrl = address;
       } else {
         try {
-          parsedUrl = new URL2(address);
+          parsedUrl = new URL3(address);
         } catch {
           throw new SyntaxError(`Invalid URL: ${address}`);
         }
@@ -2869,7 +2869,7 @@ var require_websocket = __commonJS({
       }
       const defaultPort = isSecure ? 443 : 80;
       const key = randomBytes(16).toString("base64");
-      const request2 = isSecure ? https3.request : http4.request;
+      const request2 = isSecure ? https3.request : http5.request;
       const protocolSet = /* @__PURE__ */ new Set();
       let perMessageDeflate;
       opts.createConnection = opts.createConnection || (isSecure ? tlsConnect : netConnect);
@@ -2976,7 +2976,7 @@ var require_websocket = __commonJS({
           req.abort();
           let addr;
           try {
-            addr = new URL2(location, address);
+            addr = new URL3(location, address);
           } catch (e) {
             const err = new SyntaxError(`Invalid URL: ${location}`);
             emitErrorAndClose(websocket, err);
@@ -3388,7 +3388,7 @@ var require_websocket_server = __commonJS({
   "node_modules/.pnpm/ws@8.21.1/node_modules/ws/lib/websocket-server.js"(exports2, module2) {
     "use strict";
     var EventEmitter = require("events");
-    var http4 = require("http");
+    var http5 = require("http");
     var { Duplex } = require("stream");
     var { createHash } = require("crypto");
     var extension2 = require_extension();
@@ -3469,8 +3469,8 @@ var require_websocket_server = __commonJS({
           );
         }
         if (options.port != null) {
-          this._server = http4.createServer((req, res) => {
-            const body = http4.STATUS_CODES[426];
+          this._server = http5.createServer((req, res) => {
+            const body = http5.STATUS_CODES[426];
             res.writeHead(426, {
               "Content-Length": body.length,
               "Content-Type": "text/plain"
@@ -3768,7 +3768,7 @@ var require_websocket_server = __commonJS({
       this.destroy();
     }
     function abortHandshake(socket, code, message, headers) {
-      message = message || http4.STATUS_CODES[code];
+      message = message || http5.STATUS_CODES[code];
       headers = {
         Connection: "close",
         "Content-Type": "text/html",
@@ -3777,7 +3777,7 @@ var require_websocket_server = __commonJS({
       };
       socket.once("finish", socket.destroy);
       socket.end(
-        `HTTP/1.1 ${code} ${http4.STATUS_CODES[code]}\r
+        `HTTP/1.1 ${code} ${http5.STATUS_CODES[code]}\r
 ` + Object.keys(headers).map((h) => `${h}: ${headers[h]}`).join("\r\n") + "\r\n\r\n" + message
       );
     }
@@ -3800,14 +3800,19 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
-var vscode5 = __toESM(require("vscode"));
-var path6 = __toESM(require("path"));
-var os4 = __toESM(require("os"));
-var fs7 = __toESM(require("fs"));
+var vscode8 = __toESM(require("vscode"));
+var http4 = __toESM(require("http"));
+var crypto2 = __toESM(require("crypto"));
+var path7 = __toESM(require("path"));
+var os5 = __toESM(require("os"));
+var fs8 = __toESM(require("fs"));
 
 // src/lsClient.ts
 var http = __toESM(require("http"));
 var https = __toESM(require("https"));
+var fs = __toESM(require("fs"));
+var os = __toESM(require("os"));
+var path = __toESM(require("path"));
 var import_child_process = require("child_process");
 var import_util = require("util");
 var execAsync = (0, import_util.promisify)(import_child_process.exec);
@@ -4047,56 +4052,185 @@ var LsClient = class {
     }
   }
   async getAllTrajectories() {
-    const body = await this.call("GetAllCascadeTrajectories", {});
-    if (!body)
-      return [];
-    let parsed;
+    const listMap = /* @__PURE__ */ new Map();
     try {
-      parsed = JSON.parse(body);
-    } catch {
-      return [];
-    }
-    const summaries = parsed?.trajectorySummaries;
-    let list = [];
-    if (summaries && typeof summaries === "object" && !Array.isArray(summaries)) {
-      list = Object.entries(summaries).map(([cascadeId, s]) => {
-        const wsUri = String(
-          s?.workspaces?.[0]?.workspaceFolderAbsoluteUri ?? s?.trajectoryMetadata?.workspaces?.[0]?.workspaceFolderAbsoluteUri ?? ""
-        );
-        return {
-          id: cascadeId,
-          title: s?.summary ?? s?.title ?? s?.name ?? void 0,
-          status: s?.status ?? void 0,
-          updatedAt: s?.lastModifiedTime ?? s?.lastUserInputTime ?? s?.createdTime ?? void 0,
-          workspaceUri: wsUri || void 0,
-          workspaceName: wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : void 0,
-          raw: s
-        };
-      });
-    } else {
-      const rawArray = parsed?.trajectories ?? parsed?.cascade_trajectories ?? parsed?.cascades ?? [];
-      if (Array.isArray(rawArray)) {
-        list = rawArray.map((t) => ({
-          id: String(t.cascadeId ?? t.cascade_id ?? t.id ?? t.trajectoryId ?? t._id ?? ""),
-          title: t.title ?? t.name ?? t.summary ?? void 0,
-          status: t.status ?? t.state ?? void 0,
-          updatedAt: t.updatedAt ?? t.updated_at ?? t.lastModified ?? void 0,
-          raw: t
-        }));
+      const body = await this.call("GetAllCascadeTrajectories", {});
+      if (body) {
+        const parsed = JSON.parse(body);
+        const summaries = parsed?.trajectorySummaries;
+        if (summaries && typeof summaries === "object" && !Array.isArray(summaries)) {
+          for (const [cascadeId, s] of Object.entries(summaries)) {
+            const wsUri = String(
+              s?.workspaces?.[0]?.workspaceFolderAbsoluteUri ?? s?.trajectoryMetadata?.workspaces?.[0]?.workspaceFolderAbsoluteUri ?? s?.trajectoryMetadata?.workspaceUris?.[0] ?? ""
+            );
+            listMap.set(cascadeId, {
+              id: cascadeId,
+              title: s?.summary ?? s?.title ?? s?.name ?? void 0,
+              status: s?.status ?? void 0,
+              updatedAt: s?.lastModifiedTime ?? s?.lastUserInputTime ?? s?.createdTime ?? void 0,
+              workspaceUri: wsUri || void 0,
+              workspaceName: wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : void 0,
+              raw: s
+            });
+          }
+        }
       }
+    } catch (e) {
+      this.log(`[LS] GetAllCascadeTrajectories RPC error: ${e?.message ?? e}`);
     }
+    try {
+      const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
+      if (fs.existsSync(brainDir)) {
+        const entries = fs.readdirSync(brainDir);
+        for (const id of entries) {
+          if (id.startsWith(".") || id === "tempmediaStorage")
+            continue;
+          if (listMap.has(id))
+            continue;
+          const transcriptPath = path.join(brainDir, id, ".system_generated", "logs", "transcript.jsonl");
+          if (!fs.existsSync(transcriptPath))
+            continue;
+          try {
+            const stat = fs.statSync(transcriptPath);
+            const fd = fs.openSync(transcriptPath, "r");
+            const buf = Buffer.alloc(12288);
+            const bytesRead = fs.readSync(fd, buf, 0, 12288, 0);
+            fs.closeSync(fd);
+            const text = buf.toString("utf8", 0, bytesRead);
+            const lines = text.split("\n");
+            let wsUri = "";
+            let title = "";
+            for (const line of lines) {
+              if (!line.trim())
+                continue;
+              try {
+                const step = JSON.parse(line);
+                const content = String(step.content || "");
+                if (!wsUri) {
+                  const mUser = content.match(/<user_information>[\s\S]*?([\/][^\s\n\r\-]+)\s*->/);
+                  const mDoc = content.match(/Active Document:\s*([\/][^\n\r]+)/);
+                  if (mUser) {
+                    wsUri = "file://" + mUser[1].trim();
+                  } else if (mDoc) {
+                    const fullDoc = mDoc[1].trim().split(" ")[0];
+                    const parts = fullDoc.split("/");
+                    if (parts.length >= 4) {
+                      wsUri = "file://" + parts.slice(0, 4).join("/");
+                    }
+                  }
+                }
+                if (!title && step.type === "CONVERSATION_HISTORY") {
+                  const tm = content.match(/## Conversation [^:]+:\s*([^\n\r]+)/);
+                  if (tm)
+                    title = tm[1].trim();
+                }
+                if (!title && step.type === "USER_INPUT") {
+                  const req = content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+                  if (req) {
+                    title = req[1].split("\n")[0].slice(0, 65).trim();
+                  }
+                }
+              } catch {
+              }
+            }
+            const wsName = wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : void 0;
+            listMap.set(id, {
+              id,
+              title: title || `Conversation ${id.slice(0, 8)}`,
+              status: "CASCADE_RUN_STATUS_IDLE",
+              updatedAt: stat.mtime.toISOString(),
+              workspaceUri: wsUri || void 0,
+              workspaceName: wsName || void 0
+            });
+          } catch {
+          }
+        }
+      }
+    } catch (e) {
+      this.log(`[LS] brain disk scan warning: ${e?.message ?? e}`);
+    }
+    const list = Array.from(listMap.values());
     list.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
     return list;
   }
   async getTrajectory(cascadeId) {
-    const body = await this.call("GetCascadeTrajectory", { cascadeId });
-    if (!body)
-      return null;
     try {
-      return JSON.parse(body);
+      const body = await this.call("GetCascadeTrajectory", { cascadeId });
+      if (body) {
+        const parsed = JSON.parse(body);
+        if (parsed?.trajectory?.steps && parsed.trajectory.steps.length > 0) {
+          return parsed;
+        }
+      }
     } catch {
-      return null;
     }
+    try {
+      const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
+      const transcriptPath = path.join(brainDir, cascadeId, ".system_generated", "logs", "transcript.jsonl");
+      if (fs.existsSync(transcriptPath)) {
+        const raw = fs.readFileSync(transcriptPath, "utf8");
+        const lines = raw.split("\n");
+        const steps = [];
+        for (const line of lines) {
+          if (!line.trim())
+            continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed.type === "USER_INPUT") {
+              let userText = parsed.content || "";
+              const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+              if (req)
+                userText = req[1];
+              steps.push({
+                type: "CORTEX_STEP_TYPE_USER_INPUT",
+                status: "CORTEX_STEP_STATUS_DONE",
+                userInput: { userResponse: userText },
+                metadata: {
+                  sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? steps.length },
+                  createdAt: parsed.created_at
+                }
+              });
+            } else if (parsed.type === "PLANNER_RESPONSE") {
+              steps.push({
+                type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                status: "CORTEX_STEP_STATUS_DONE",
+                plannerResponse: {
+                  response: parsed.content || "",
+                  toolCalls: parsed.tool_calls
+                },
+                metadata: {
+                  createdAt: parsed.created_at
+                }
+              });
+            } else if (parsed.type === "TOOL_CALL" || parsed.tool_calls) {
+              const tc = parsed.tool_calls?.[0];
+              steps.push({
+                type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
+                status: "CORTEX_STEP_STATUS_DONE",
+                content: parsed.content,
+                metadata: {
+                  toolAction: tc?.name,
+                  toolSummary: tc?.toolSummary,
+                  toolCall: { argumentsJson: JSON.stringify(tc?.parameters || {}) },
+                  createdAt: parsed.created_at
+                }
+              });
+            }
+          } catch {
+          }
+        }
+        if (steps.length > 0) {
+          return {
+            trajectory: {
+              trajectoryId: cascadeId,
+              steps
+            }
+          };
+        }
+      }
+    } catch {
+    }
+    return null;
   }
   async cancel(cascadeId) {
     const body = await this.call("CancelCascadeInvocation", { cascadeId });
@@ -4289,9 +4423,9 @@ function isGenerating(steps) {
 
 // src/chatController.ts
 var vscode = __toESM(require("vscode"));
-var fs = __toESM(require("fs"));
-var os = __toESM(require("os"));
-var path = __toESM(require("path"));
+var fs2 = __toESM(require("fs"));
+var os2 = __toESM(require("os"));
+var path2 = __toESM(require("path"));
 
 // src/cdpClient.ts
 var http2 = __toESM(require("http"));
@@ -4308,10 +4442,10 @@ var import_websocket_server = __toESM(require_websocket_server(), 1);
 var wrapper_default = import_websocket.default;
 
 // src/cdpClient.ts
-function httpJson(port, path7, timeoutMs = 2500) {
+function httpJson(port, path8, timeoutMs = 2500) {
   return new Promise((resolve3, reject) => {
     const req = http2.get(
-      { host: "127.0.0.1", port, path: path7, timeout: timeoutMs },
+      { host: "127.0.0.1", port, path: path8, timeout: timeoutMs },
       (res) => {
         let body = "";
         res.on("data", (c) => body += c.toString());
@@ -4810,27 +4944,41 @@ var ChatController = class {
     }
   }
   // ---- Discover the currently active cascade id ----
-  // LS is the source of truth: GetAllCascadeTrajectories returns the same data
-  // the IDE panel renders, so picking from it keeps IDE and web in sync.
   async resolveActiveCascadeId() {
     if (this.userSelected && this.activeCascadeId)
       return this.activeCascadeId;
-    const list = await this.ls.getAllTrajectories();
-    if (list.length > 0) {
-      const running2 = list.find(
-        (t) => String(t.status ?? "").toUpperCase().includes("RUNNING")
-      );
-      this.activeCascadeId = (running2 ?? list[0]).id;
-      return this.activeCascadeId;
-    }
     try {
       const diag = await vscode.commands.executeCommand(
         "antigravity.getDiagnostics"
       );
       const id = diag?.recentTrajectories?.[0]?.googleAgentId ?? diag?.recentTrajectories?.[0]?.cascadeId ?? "";
-      if (id)
+      if (id) {
         this.activeCascadeId = String(id);
+        return this.activeCascadeId;
+      }
     } catch {
+    }
+    const list = await this.ls.getAllTrajectories();
+    if (list.length > 0) {
+      const folders = vscode.workspace.workspaceFolders;
+      const curWsUri = folders?.[0]?.uri?.toString();
+      const normCur = curWsUri ? decodeURIComponent(curWsUri.replace(/\/+$/, "")).toLowerCase() : "";
+      let targetList = list;
+      if (normCur) {
+        const filtered = list.filter((t) => {
+          if (!t.workspaceUri)
+            return false;
+          const normT = decodeURIComponent(t.workspaceUri.replace(/\/+$/, "")).toLowerCase();
+          return normT === normCur || normCur.includes(normT) || normT.includes(normCur);
+        });
+        if (filtered.length > 0)
+          targetList = filtered;
+      }
+      const running2 = targetList.find(
+        (t) => String(t.status ?? "").toUpperCase().includes("RUNNING")
+      );
+      this.activeCascadeId = (running2 ?? targetList[0]).id;
+      return this.activeCascadeId;
     }
     return this.activeCascadeId;
   }
@@ -5368,9 +5516,22 @@ var ChatController = class {
       }
     }
     if (generating !== this.lastGenerating || statusText !== this.lastStatusText) {
+      const wasGenerating = this.lastGenerating;
       this.lastGenerating = generating;
       this.lastStatusText = statusText;
       this.emit({ type: "status", cascadeId: id, generating, statusText });
+      if (wasGenerating && !generating) {
+        this.getModels().then((models) => {
+          if (models && models.length > 0)
+            this.emit({ type: "models", models });
+        }).catch(() => {
+        });
+        this.getQuota().then((quota) => {
+          if (quota)
+            this.emit({ type: "quota", quota });
+        }).catch(() => {
+        });
+      }
     }
   }
 };
@@ -5503,9 +5664,9 @@ ${rawContent}` : rawContent;
   }
   if (type === "GREP_SEARCH") {
     const q = args.Query || "";
-    const path7 = args.SearchPath || "";
+    const path8 = args.SearchPath || "";
     let text = `Query: "${q}"
-Path: ${path7}`;
+Path: ${path8}`;
     if (rawContent)
       text += `
 
@@ -5833,14 +5994,14 @@ function numOr(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 function getStatsFilePath() {
-  const dir = path.join(os.homedir(), ".antigravity_cockpit");
-  if (!fs.existsSync(dir)) {
+  const dir = path2.join(os2.homedir(), ".antigravity_cockpit");
+  if (!fs2.existsSync(dir)) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs2.mkdirSync(dir, { recursive: true });
     } catch {
     }
   }
-  return path.join(dir, "today_stats.json");
+  return path2.join(dir, "today_stats.json");
 }
 function getTodayDateStr() {
   const d = /* @__PURE__ */ new Date();
@@ -5853,8 +6014,8 @@ function loadTodayStats() {
   const filePath = getStatsFilePath();
   const todayStr = getTodayDateStr();
   try {
-    if (fs.existsSync(filePath)) {
-      const raw = fs.readFileSync(filePath, "utf-8");
+    if (fs2.existsSync(filePath)) {
+      const raw = fs2.readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(raw);
       if (parsed && parsed.date === todayStr) {
         return {
@@ -5872,7 +6033,7 @@ function loadTodayStats() {
 function saveTodayStats(stats) {
   const filePath = getStatsFilePath();
   try {
-    fs.writeFileSync(filePath, JSON.stringify(stats, null, 2), "utf-8");
+    fs2.writeFileSync(filePath, JSON.stringify(stats, null, 2), "utf-8");
   } catch {
   }
 }
@@ -5941,328 +6102,15 @@ function accumulateStatsFromSteps(cascadeId, steps, onStatsUpdate) {
 // src/server.ts
 var http3 = __toESM(require("http"));
 var crypto = __toESM(require("crypto"));
-var fs5 = __toESM(require("fs"));
-var path4 = __toESM(require("path"));
+var fs6 = __toESM(require("fs"));
+var path5 = __toESM(require("path"));
 var import_url = require("url");
-
-// src/fileController.ts
-var vscode2 = __toESM(require("vscode"));
-var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
-function workspaceRoot() {
-  const folders = vscode2.workspace.workspaceFolders;
-  if (!folders || folders.length === 0)
-    return null;
-  return folders[0].uri.fsPath;
-}
-function resolveSafe(rel) {
-  const root = workspaceRoot();
-  if (!root)
-    return null;
-  const abs = path2.isAbsolute(rel) ? path2.resolve(rel) : path2.resolve(root, rel.replace(/^[/\\]+/, ""));
-  if (abs !== root && !abs.startsWith(root + path2.sep))
-    return null;
-  return abs;
-}
-var FileController = {
-  hasWorkspace() {
-    return workspaceRoot() !== null;
-  },
-  root() {
-    return workspaceRoot();
-  },
-  list(rel = "") {
-    const abs = resolveSafe(rel);
-    const root = workspaceRoot();
-    if (!abs || !root)
-      return [];
-    if (!fs2.existsSync(abs))
-      return [];
-    const stat = fs2.statSync(abs);
-    if (!stat.isDirectory())
-      return [];
-    const items = fs2.readdirSync(abs, { withFileTypes: true });
-    const out = [];
-    for (const it of items) {
-      if (it.name === ".git" || it.name === "node_modules")
-        continue;
-      const childAbs = path2.join(abs, it.name);
-      const relPath = path2.relative(root, childAbs).split(path2.sep).join("/");
-      if (it.isDirectory()) {
-        out.push({ name: it.name, path: relPath, type: "dir" });
-      } else {
-        let size = 0;
-        try {
-          size = fs2.statSync(childAbs).size;
-        } catch {
-        }
-        out.push({ name: it.name, path: relPath, type: "file", size });
-      }
-    }
-    out.sort(
-      (a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1
-    );
-    return out;
-  },
-  read(rel) {
-    const abs = resolveSafe(rel);
-    if (!abs)
-      return { error: "invalid path" };
-    if (!fs2.existsSync(abs))
-      return { error: "not found" };
-    const stat = fs2.statSync(abs);
-    if (stat.isDirectory())
-      return { error: "is a directory" };
-    if (stat.size > 2 * 1024 * 1024)
-      return { error: "file too large (>2MB)" };
-    try {
-      return { text: fs2.readFileSync(abs, "utf8") };
-    } catch (e) {
-      return { error: String(e?.message ?? e) };
-    }
-  },
-  readBinary(rel) {
-    const abs = resolveSafe(rel);
-    if (!abs || !fs2.existsSync(abs))
-      return null;
-    try {
-      return fs2.readFileSync(abs);
-    } catch {
-      return null;
-    }
-  },
-  write(rel, text) {
-    const abs = resolveSafe(rel);
-    if (!abs)
-      return { error: "invalid path" };
-    try {
-      fs2.mkdirSync(path2.dirname(abs), { recursive: true });
-      fs2.writeFileSync(abs, text, "utf8");
-      return { ok: true };
-    } catch (e) {
-      return { error: String(e?.message ?? e) };
-    }
-  },
-  // Save an uploaded file/image (buffer) into the workspace, default under
-  // an `uploads/` folder. Returns the workspace-relative path.
-  saveUpload(filename, data, subdir = "uploads") {
-    const root = workspaceRoot();
-    if (!root)
-      return { error: "no workspace open" };
-    const safeName = path2.basename(filename).replace(/[^\w.\-]+/g, "_");
-    const relPath = path2.posix.join(subdir, `${Date.now()}_${safeName}`);
-    const abs = resolveSafe(relPath);
-    if (!abs)
-      return { error: "invalid path" };
-    try {
-      fs2.mkdirSync(path2.dirname(abs), { recursive: true });
-      fs2.writeFileSync(abs, data);
-      return { path: relPath, abs };
-    } catch (e) {
-      return { error: String(e?.message ?? e) };
-    }
-  },
-  delete(rel) {
-    const abs = resolveSafe(rel);
-    if (!abs)
-      return { error: "invalid path" };
-    if (!fs2.existsSync(abs))
-      return { error: "not found" };
-    try {
-      const stat = fs2.statSync(abs);
-      if (stat.isDirectory())
-        fs2.rmSync(abs, { recursive: true, force: true });
-      else
-        fs2.unlinkSync(abs);
-      return { ok: true };
-    } catch (e) {
-      return { error: String(e?.message ?? e) };
-    }
-  },
-  async openInEditor(rel) {
-    const abs = resolveSafe(rel);
-    if (!abs || !fs2.existsSync(abs))
-      return false;
-    try {
-      const doc = await vscode2.workspace.openTextDocument(abs);
-      await vscode2.window.showTextDocument(doc);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-};
-
-// src/gitController.ts
-var vscode3 = __toESM(require("vscode"));
-var import_child_process2 = require("child_process");
-var import_util2 = require("util");
-var execAsync2 = (0, import_util2.promisify)(import_child_process2.exec);
-function cwd() {
-  const folders = vscode3.workspace.workspaceFolders;
-  if (!folders || folders.length === 0)
-    return null;
-  return folders[0].uri.fsPath;
-}
-async function run(cmd, timeout = 2e4) {
-  const dir = cwd();
-  if (!dir)
-    return { stdout: "", stderr: "no workspace open", ok: false };
-  try {
-    const { stdout, stderr } = await execAsync2(cmd, {
-      cwd: dir,
-      timeout,
-      maxBuffer: 8 * 1024 * 1024
-    });
-    return { stdout: String(stdout), stderr: String(stderr), ok: true };
-  } catch (e) {
-    return {
-      stdout: String(e?.stdout ?? ""),
-      stderr: String(e?.stderr ?? e?.message ?? e),
-      ok: false
-    };
-  }
-}
-var GitController = {
-  async isRepo() {
-    const r = await run("git rev-parse --is-inside-work-tree");
-    return r.ok && r.stdout.trim() === "true";
-  },
-  async status() {
-    const r = await run("git status --porcelain=v1 --branch");
-    const files = [];
-    let branch = "";
-    let ahead = 0;
-    let behind = 0;
-    for (const line of r.stdout.split("\n")) {
-      if (!line)
-        continue;
-      if (line.startsWith("##")) {
-        const m = line.match(/##\s+([^\s.]+)/);
-        if (m)
-          branch = m[1];
-        const a = line.match(/ahead (\d+)/);
-        const b = line.match(/behind (\d+)/);
-        if (a)
-          ahead = parseInt(a[1], 10);
-        if (b)
-          behind = parseInt(b[1], 10);
-        continue;
-      }
-      const index = line[0];
-      const work = line[1];
-      const path7 = line.slice(3);
-      files.push({ path: path7, index, work });
-    }
-    return { branch, files, ahead, behind };
-  },
-  async diff(file) {
-    const cmd = file ? `git diff -- ${JSON.stringify(file)}` : "git diff";
-    const r = await run(cmd);
-    return r.stdout || r.stderr;
-  },
-  async log(limit = 20) {
-    const sep2 = "";
-    const r = await run(
-      `git log -n ${limit} --pretty=format:%h${sep2}%an${sep2}%ad${sep2}%s --date=short`
-    );
-    const out = [];
-    for (const line of r.stdout.split("\n")) {
-      if (!line)
-        continue;
-      const [hash, author, date, subject] = line.split(sep2);
-      out.push({ hash, author, date, subject });
-    }
-    return out;
-  },
-  async stageAll() {
-    const r = await run("git add -A");
-    return { ok: r.ok, message: r.stderr || "staged all changes" };
-  },
-  async stage(file) {
-    const r = await run(`git add -- ${JSON.stringify(file)}`);
-    return { ok: r.ok, message: r.stderr || `staged ${file}` };
-  },
-  // Flexible stage: accepts "." / "-A" for everything, a single path string,
-  // or an array of paths. Used by the REST API's git/add route.
-  async add(files) {
-    if (files === "." || files === "-A" || files === "*") {
-      return this.stageAll();
-    }
-    const list = Array.isArray(files) ? files : [files];
-    const safe = list.filter(Boolean).map((f) => JSON.stringify(f)).join(" ");
-    if (!safe)
-      return this.stageAll();
-    const r = await run(`git add -- ${safe}`);
-    return { ok: r.ok, message: r.stderr || `staged ${list.join(", ")}` };
-  },
-  async commit(message) {
-    const escaped = message.replace(/"/g, '\\"');
-    const r = await run(`git commit -m "${escaped}"`);
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async push(branch, setUpstream = false) {
-    let cmd = "git push";
-    const target = branch || (setUpstream ? (await this.status()).branch : "");
-    if (setUpstream && target) {
-      cmd = `git push -u origin ${JSON.stringify(target)}`;
-    } else if (target) {
-      cmd = `git push origin ${JSON.stringify(target)}`;
-    }
-    const r = await run(cmd, 6e4);
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async pull() {
-    const r = await run("git pull", 6e4);
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async createBranch(name) {
-    const safe = name.replace(/[^\w./\-]+/g, "-");
-    const r = await run(`git checkout -b ${JSON.stringify(safe)}`);
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async checkout(ref) {
-    const r = await run(`git checkout ${JSON.stringify(ref)}`);
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async branches() {
-    const r = await run("git branch --format=%(refname:short)");
-    const cur = await run("git rev-parse --abbrev-ref HEAD");
-    return {
-      current: cur.stdout.trim(),
-      all: r.stdout.split("\n").map((s) => s.trim()).filter(Boolean)
-    };
-  },
-  // --- GitHub via gh CLI (optional) ---
-  async ghAvailable() {
-    const r = await run("gh --version", 5e3);
-    return r.ok;
-  },
-  async createPR(title, body) {
-    if (!await this.ghAvailable())
-      return { ok: false, message: "gh CLI not installed" };
-    const t = title.replace(/"/g, '\\"');
-    const b = body.replace(/"/g, '\\"');
-    const r = await run(
-      `gh pr create --title "${t}" --body "${b}"`,
-      6e4
-    );
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  },
-  async listPRs() {
-    if (!await this.ghAvailable())
-      return { ok: false, message: "gh CLI not installed" };
-    const r = await run(
-      "gh pr list --limit 20 --json number,title,author,state 2>/dev/null || gh pr list"
-    );
-    return { ok: r.ok, message: r.stdout || r.stderr };
-  }
-};
+var vscode6 = __toESM(require("vscode"));
 
 // src/settingsController.ts
-var vscode4 = __toESM(require("vscode"));
+var vscode2 = __toESM(require("vscode"));
 var fs3 = __toESM(require("fs"));
-var os2 = __toESM(require("os"));
+var os3 = __toESM(require("os"));
 var path3 = __toESM(require("path"));
 var CFG = "antigravityRemotePlus";
 var EDITABLE_KEYS = [
@@ -6277,7 +6125,7 @@ var EDITABLE_KEYS = [
   "workspaceRoot"
 ];
 function cockpitDir() {
-  return path3.join(os2.homedir(), ".antigravity_cockpit");
+  return path3.join(os3.homedir(), ".antigravity_cockpit");
 }
 function readJsonSafe(file) {
   try {
@@ -6384,18 +6232,13 @@ var SettingsController = {
             headers: { Authorization: `Bearer ${serverInfo.auth_token}` }
           });
           ws.on("open", () => {
-            const payload = { account_id: match.id, email: match.email, id: match.id };
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", data: payload }));
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ action: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ command: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "ws_request_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "ws_request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "ws_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "ws_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "tools.account.switch", payload }));
-            ws.send(JSON.stringify({ type: "switch_account", email, account_id: match.id }));
+            const reqId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            ws.send(JSON.stringify({
+              type: "request.switch_account",
+              payload: { account_id: match.id, request_id: reqId }
+            }));
+            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", payload: { account_id: match.id, email: match.email } }));
+            ws.send(JSON.stringify({ type: "switch_account", account_id: match.id, email: match.email }));
             setTimeout(() => {
               try {
                 ws.close();
@@ -6408,16 +6251,38 @@ var SettingsController = {
         }
       } catch {
       }
+      if (process.platform === "darwin" && match.token?.access_token) {
+        try {
+          const { execSync } = require("child_process");
+          const expiryDate = match.token.expiry_timestamp ? new Date(match.token.expiry_timestamp * 1e3).toISOString() : new Date(Date.now() + 3600 * 1e3).toISOString();
+          const credObj = {
+            token: {
+              access_token: match.token.access_token,
+              token_type: match.token.token_type || "Bearer",
+              refresh_token: match.token.refresh_token || "",
+              expiry: expiryDate
+            },
+            auth_method: "consumer"
+          };
+          const b64 = Buffer.from(JSON.stringify(credObj)).toString("base64");
+          const keychainVal = `go-keyring-base64:${b64}`;
+          try {
+            execSync(`security delete-generic-password -s gemini -a antigravity 2>/dev/null || true`);
+          } catch {
+          }
+          execSync(`security add-generic-password -s gemini -a antigravity -w "${keychainVal}" -A`);
+        } catch {
+        }
+      }
       try {
         const { exec: exec3 } = require("child_process");
         exec3(`open "cockpit-tools://switch?account_id=${match.id}&email=${encodeURIComponent(email)}"`);
         exec3(`open "cockpit-tools://switch-account?id=${match.id}&email=${encodeURIComponent(email)}"`);
-        exec3(`osascript -e 'tell application "Cockpit Tools" to activate'`);
       } catch {
       }
       try {
         const { execSync } = require("child_process");
-        const dbPath = path3.join(os2.homedir(), "Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb");
+        const dbPath = path3.join(os3.homedir(), "Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb");
         if (fs3.existsSync(dbPath)) {
           execSync(`sqlite3 "${dbPath}" "DELETE FROM ItemTable WHERE key IN ('antigravityUnifiedStateSync.oauthToken', 'antigravityUnifiedStateSync.userStatus');"`);
         }
@@ -6430,7 +6295,7 @@ var SettingsController = {
   },
   // ---- Settings ----
   get() {
-    const c = vscode4.workspace.getConfiguration(CFG);
+    const c = vscode2.workspace.getConfiguration(CFG);
     return {
       port: c.get("port", 7377),
       bindHost: c.get("bindHost", "0.0.0.0"),
@@ -6449,7 +6314,7 @@ var SettingsController = {
   //   * a single project itself (has .git / looks like a project) → the root IS
   //     the workspace, returned as the sole entry.
   workspaceFolders() {
-    const c = vscode4.workspace.getConfiguration(CFG);
+    const c = vscode2.workspace.getConfiguration(CFG);
     const root = c.get("workspaceRoot", "");
     const current = this.currentWorkspace();
     if (!root || !root.trim())
@@ -6491,10 +6356,10 @@ var SettingsController = {
     }
   },
   async update(patch) {
-    const c = vscode4.workspace.getConfiguration(CFG);
+    const c = vscode2.workspace.getConfiguration(CFG);
     for (const key of EDITABLE_KEYS) {
       if (key in patch && patch[key] !== void 0) {
-        await c.update(key, patch[key], vscode4.ConfigurationTarget.Global);
+        await c.update(key, patch[key], vscode2.ConfigurationTarget.Global);
       }
     }
     return this.get();
@@ -6502,7 +6367,7 @@ var SettingsController = {
   // ---- Filesystem browse (for the workspace picker) ----
   // Lists directories under an absolute path. Defaults to the home dir.
   browse(dir) {
-    const home = os2.homedir();
+    const home = os3.homedir();
     let target = dir && dir.trim() ? dir : home;
     try {
       target = path3.resolve(target);
@@ -6533,7 +6398,7 @@ var SettingsController = {
     };
   },
   currentWorkspace() {
-    const folders = vscode4.workspace.workspaceFolders;
+    const folders = vscode2.workspace.workspaceFolders;
     return folders && folders.length ? folders[0].uri.fsPath : null;
   },
   // Open a folder as the workspace. VS Code reloads the window to do this.
@@ -6543,9 +6408,9 @@ var SettingsController = {
       if (!fs3.existsSync(abs) || !fs3.statSync(abs).isDirectory()) {
         return { ok: false, error: "not a directory" };
       }
-      await vscode4.commands.executeCommand(
+      await vscode2.commands.executeCommand(
         "vscode.openFolder",
-        vscode4.Uri.file(abs),
+        vscode2.Uri.file(abs),
         { forceNewWindow: false }
       );
       return { ok: true };
@@ -6560,8 +6425,8 @@ function numOr2(v, fallback = 0) {
 }
 
 // src/terminalController.ts
-var import_child_process3 = require("child_process");
-var os3 = __toESM(require("os"));
+var import_child_process2 = require("child_process");
+var os4 = __toESM(require("os"));
 var fs4 = __toESM(require("fs"));
 var MAX_BUFFER = 2e5;
 function defaultShell() {
@@ -6585,13 +6450,13 @@ var TerminalController = class {
       } catch {
       }
     }
-    return os3.homedir();
+    return os4.homedir();
   }
   create(cwd2, title) {
     const id = `t${Date.now()}_${++counter}`;
     const dir = this.resolveCwd(cwd2);
     const shell = defaultShell();
-    const proc = (0, import_child_process3.spawn)(shell, process.platform === "win32" ? [] : ["-i"], {
+    const proc = (0, import_child_process2.spawn)(shell, process.platform === "win32" ? [] : ["-i"], {
       cwd: dir,
       env: { ...process.env, TERM: "xterm-256color" },
       shell: false
@@ -6683,6 +6548,619 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b[()][0-9A-Za-z]/g, "").replace(/\x1b[=>]/g, "").replace(/\x1b/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
 }
 
+// src/windowManager.ts
+var vscode5 = __toESM(require("vscode"));
+
+// src/fileController.ts
+var vscode3 = __toESM(require("vscode"));
+var fs5 = __toESM(require("fs"));
+var path4 = __toESM(require("path"));
+function workspaceRoot() {
+  const folders = vscode3.workspace.workspaceFolders;
+  if (!folders || folders.length === 0)
+    return null;
+  return folders[0].uri.fsPath;
+}
+function resolveSafe(rel) {
+  const root = workspaceRoot();
+  if (!root)
+    return null;
+  const abs = path4.isAbsolute(rel) ? path4.resolve(rel) : path4.resolve(root, rel.replace(/^[/\\]+/, ""));
+  if (abs !== root && !abs.startsWith(root + path4.sep))
+    return null;
+  return abs;
+}
+var FileController = {
+  hasWorkspace() {
+    return workspaceRoot() !== null;
+  },
+  root() {
+    return workspaceRoot();
+  },
+  list(rel = "") {
+    const abs = resolveSafe(rel);
+    const root = workspaceRoot();
+    if (!abs || !root)
+      return [];
+    if (!fs5.existsSync(abs))
+      return [];
+    const stat = fs5.statSync(abs);
+    if (!stat.isDirectory())
+      return [];
+    const items = fs5.readdirSync(abs, { withFileTypes: true });
+    const out = [];
+    for (const it of items) {
+      if (it.name === ".git" || it.name === "node_modules")
+        continue;
+      const childAbs = path4.join(abs, it.name);
+      const relPath = path4.relative(root, childAbs).split(path4.sep).join("/");
+      if (it.isDirectory()) {
+        out.push({ name: it.name, path: relPath, type: "dir" });
+      } else {
+        let size = 0;
+        try {
+          size = fs5.statSync(childAbs).size;
+        } catch {
+        }
+        out.push({ name: it.name, path: relPath, type: "file", size });
+      }
+    }
+    out.sort(
+      (a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1
+    );
+    return out;
+  },
+  read(rel) {
+    const abs = resolveSafe(rel);
+    if (!abs)
+      return { error: "invalid path" };
+    if (!fs5.existsSync(abs))
+      return { error: "not found" };
+    const stat = fs5.statSync(abs);
+    if (stat.isDirectory())
+      return { error: "is a directory" };
+    if (stat.size > 2 * 1024 * 1024)
+      return { error: "file too large (>2MB)" };
+    try {
+      return { text: fs5.readFileSync(abs, "utf8") };
+    } catch (e) {
+      return { error: String(e?.message ?? e) };
+    }
+  },
+  readBinary(rel) {
+    const abs = resolveSafe(rel);
+    if (!abs || !fs5.existsSync(abs))
+      return null;
+    try {
+      return fs5.readFileSync(abs);
+    } catch {
+      return null;
+    }
+  },
+  write(rel, text) {
+    const abs = resolveSafe(rel);
+    if (!abs)
+      return { error: "invalid path" };
+    try {
+      fs5.mkdirSync(path4.dirname(abs), { recursive: true });
+      fs5.writeFileSync(abs, text, "utf8");
+      return { ok: true };
+    } catch (e) {
+      return { error: String(e?.message ?? e) };
+    }
+  },
+  // Save an uploaded file/image (buffer) into the workspace, default under
+  // an `uploads/` folder. Returns the workspace-relative path.
+  saveUpload(filename, data, subdir = "uploads") {
+    const root = workspaceRoot();
+    if (!root)
+      return { error: "no workspace open" };
+    const safeName = path4.basename(filename).replace(/[^\w.\-]+/g, "_");
+    const relPath = path4.posix.join(subdir, `${Date.now()}_${safeName}`);
+    const abs = resolveSafe(relPath);
+    if (!abs)
+      return { error: "invalid path" };
+    try {
+      fs5.mkdirSync(path4.dirname(abs), { recursive: true });
+      fs5.writeFileSync(abs, data);
+      return { path: relPath, abs };
+    } catch (e) {
+      return { error: String(e?.message ?? e) };
+    }
+  },
+  delete(rel) {
+    const abs = resolveSafe(rel);
+    if (!abs)
+      return { error: "invalid path" };
+    if (!fs5.existsSync(abs))
+      return { error: "not found" };
+    try {
+      const stat = fs5.statSync(abs);
+      if (stat.isDirectory())
+        fs5.rmSync(abs, { recursive: true, force: true });
+      else
+        fs5.unlinkSync(abs);
+      return { ok: true };
+    } catch (e) {
+      return { error: String(e?.message ?? e) };
+    }
+  },
+  async openInEditor(rel) {
+    const abs = resolveSafe(rel);
+    if (!abs || !fs5.existsSync(abs))
+      return false;
+    try {
+      const doc = await vscode3.workspace.openTextDocument(abs);
+      await vscode3.window.showTextDocument(doc);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+};
+
+// src/gitController.ts
+var vscode4 = __toESM(require("vscode"));
+var import_child_process3 = require("child_process");
+var import_util2 = require("util");
+var execAsync2 = (0, import_util2.promisify)(import_child_process3.exec);
+function cwd() {
+  const folders = vscode4.workspace.workspaceFolders;
+  if (!folders || folders.length === 0)
+    return null;
+  return folders[0].uri.fsPath;
+}
+async function run(cmd, timeout = 2e4) {
+  const dir = cwd();
+  if (!dir)
+    return { stdout: "", stderr: "no workspace open", ok: false };
+  try {
+    const { stdout, stderr } = await execAsync2(cmd, {
+      cwd: dir,
+      timeout,
+      maxBuffer: 8 * 1024 * 1024
+    });
+    return { stdout: String(stdout), stderr: String(stderr), ok: true };
+  } catch (e) {
+    return {
+      stdout: String(e?.stdout ?? ""),
+      stderr: String(e?.stderr ?? e?.message ?? e),
+      ok: false
+    };
+  }
+}
+var GitController = {
+  async isRepo() {
+    const r = await run("git rev-parse --is-inside-work-tree");
+    return r.ok && r.stdout.trim() === "true";
+  },
+  async status() {
+    const r = await run("git status --porcelain=v1 --branch");
+    const files = [];
+    let branch = "";
+    let ahead = 0;
+    let behind = 0;
+    for (const line of r.stdout.split("\n")) {
+      if (!line)
+        continue;
+      if (line.startsWith("##")) {
+        const m = line.match(/##\s+([^\s.]+)/);
+        if (m)
+          branch = m[1];
+        const a = line.match(/ahead (\d+)/);
+        const b = line.match(/behind (\d+)/);
+        if (a)
+          ahead = parseInt(a[1], 10);
+        if (b)
+          behind = parseInt(b[1], 10);
+        continue;
+      }
+      const index = line[0];
+      const work = line[1];
+      const path8 = line.slice(3);
+      files.push({ path: path8, index, work });
+    }
+    return { branch, files, ahead, behind };
+  },
+  async diff(file) {
+    const cmd = file ? `git diff -- ${JSON.stringify(file)}` : "git diff";
+    const r = await run(cmd);
+    return r.stdout || r.stderr;
+  },
+  async log(limit = 20) {
+    const sep2 = "";
+    const r = await run(
+      `git log -n ${limit} --pretty=format:%h${sep2}%an${sep2}%ad${sep2}%s --date=short`
+    );
+    const out = [];
+    for (const line of r.stdout.split("\n")) {
+      if (!line)
+        continue;
+      const [hash, author, date, subject] = line.split(sep2);
+      out.push({ hash, author, date, subject });
+    }
+    return out;
+  },
+  async stageAll() {
+    const r = await run("git add -A");
+    return { ok: r.ok, message: r.stderr || "staged all changes" };
+  },
+  async stage(file) {
+    const r = await run(`git add -- ${JSON.stringify(file)}`);
+    return { ok: r.ok, message: r.stderr || `staged ${file}` };
+  },
+  // Flexible stage: accepts "." / "-A" for everything, a single path string,
+  // or an array of paths. Used by the REST API's git/add route.
+  async add(files) {
+    if (files === "." || files === "-A" || files === "*") {
+      return this.stageAll();
+    }
+    const list = Array.isArray(files) ? files : [files];
+    const safe = list.filter(Boolean).map((f) => JSON.stringify(f)).join(" ");
+    if (!safe)
+      return this.stageAll();
+    const r = await run(`git add -- ${safe}`);
+    return { ok: r.ok, message: r.stderr || `staged ${list.join(", ")}` };
+  },
+  async commit(message) {
+    const escaped = message.replace(/"/g, '\\"');
+    const r = await run(`git commit -m "${escaped}"`);
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async push(branch, setUpstream = false) {
+    let cmd = "git push";
+    const target = branch || (setUpstream ? (await this.status()).branch : "");
+    if (setUpstream && target) {
+      cmd = `git push -u origin ${JSON.stringify(target)}`;
+    } else if (target) {
+      cmd = `git push origin ${JSON.stringify(target)}`;
+    }
+    const r = await run(cmd, 6e4);
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async pull() {
+    const r = await run("git pull", 6e4);
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async createBranch(name) {
+    const safe = name.replace(/[^\w./\-]+/g, "-");
+    const r = await run(`git checkout -b ${JSON.stringify(safe)}`);
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async checkout(ref) {
+    const r = await run(`git checkout ${JSON.stringify(ref)}`);
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async branches() {
+    const r = await run("git branch --format=%(refname:short)");
+    const cur = await run("git rev-parse --abbrev-ref HEAD");
+    return {
+      current: cur.stdout.trim(),
+      all: r.stdout.split("\n").map((s) => s.trim()).filter(Boolean)
+    };
+  },
+  // --- GitHub via gh CLI (optional) ---
+  async ghAvailable() {
+    const r = await run("gh --version", 5e3);
+    return r.ok;
+  },
+  async createPR(title, body) {
+    if (!await this.ghAvailable())
+      return { ok: false, message: "gh CLI not installed" };
+    const t = title.replace(/"/g, '\\"');
+    const b = body.replace(/"/g, '\\"');
+    const r = await run(
+      `gh pr create --title "${t}" --body "${b}"`,
+      6e4
+    );
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  },
+  async listPRs() {
+    if (!await this.ghAvailable())
+      return { ok: false, message: "gh CLI not installed" };
+    const r = await run(
+      "gh pr list --limit 20 --json number,title,author,state 2>/dev/null || gh pr list"
+    );
+    return { ok: r.ok, message: r.stdout || r.stderr };
+  }
+};
+
+// src/windowManager.ts
+var WindowManager = class {
+  constructor(localInfo, chat2, terminals2, log2, broadcastToWeb) {
+    this.remoteWindows = /* @__PURE__ */ new Map();
+    this.wss = null;
+    this.rpcCounter = 0;
+    this.localInfo = localInfo;
+    this.chat = chat2;
+    this.terminals = terminals2;
+    this.log = log2;
+    this.broadcastToWeb = broadcastToWeb;
+    this.chat.onEvent((e) => {
+      if (e.type === "state" && e.state) {
+        this.localInfo.activeCascadeId = e.state.cascadeId;
+        this.localInfo.isGenerating = !!e.state.generating;
+        this.localInfo.statusText = e.state.statusText || "Idle";
+      } else if (e.type === "state_update" || e.type === "status") {
+        this.localInfo.isGenerating = !!e.generating;
+        this.localInfo.statusText = e.statusText || "Idle";
+      }
+      this.broadcastToWeb({ ...e, windowId: this.localInfo.id });
+    });
+  }
+  updateLocalInfo(updates) {
+    Object.assign(this.localInfo, updates);
+    this.broadcastWindows();
+  }
+  getLocalWindowId() {
+    return this.localInfo.id;
+  }
+  attachWebSocketServer(server2, tokenValidator) {
+    this.wss = new import_websocket_server.default({ noServer: true });
+    server2.on("upgrade", (req, socket, head) => {
+      const url = new URL(req.url || "/", `http://${req.headers.host}`);
+      if (url.pathname === "/api/ide-ws") {
+        if (!tokenValidator(req)) {
+          socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+        this.wss?.handleUpgrade(req, socket, head, (ws) => {
+          this.wss?.emit("connection", ws, req);
+        });
+      }
+    });
+    this.wss.on("connection", (ws) => {
+      let registeredWindowId = null;
+      ws.on("message", (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString("utf8"));
+          if (msg.type === "register") {
+            registeredWindowId = msg.window.id;
+            const session = {
+              info: { ...msg.window, isHost: false, lastActive: Date.now() },
+              ws,
+              pendingRpcs: /* @__PURE__ */ new Map()
+            };
+            this.remoteWindows.set(registeredWindowId, session);
+            this.log(`[win-mgr] secondary window registered: ${registeredWindowId} (${msg.window.title})`);
+            const reply = { type: "registered", ok: true };
+            ws.send(JSON.stringify(reply));
+            this.broadcastWindows();
+          } else if (msg.type === "heartbeat") {
+            const session = registeredWindowId ? this.remoteWindows.get(registeredWindowId) : null;
+            if (session) {
+              session.info.lastActive = Date.now();
+              if (msg.isGenerating !== void 0)
+                session.info.isGenerating = msg.isGenerating;
+              if (msg.statusText !== void 0)
+                session.info.statusText = msg.statusText;
+              if (msg.activeCascadeId !== void 0)
+                session.info.activeCascadeId = msg.activeCascadeId;
+              this.broadcastWindows();
+            }
+          } else if (msg.type === "event") {
+            this.broadcastToWeb({ ...msg.event, windowId: msg.windowId });
+          } else if (msg.type === "rpc_result") {
+            const session = registeredWindowId ? this.remoteWindows.get(registeredWindowId) : null;
+            if (session) {
+              const pending = session.pendingRpcs.get(msg.response.id);
+              if (pending) {
+                clearTimeout(pending.timer);
+                session.pendingRpcs.delete(msg.response.id);
+                if (msg.response.ok) {
+                  pending.resolve(msg.response.data);
+                } else {
+                  pending.reject(new Error(msg.response.error || "RPC failed"));
+                }
+              }
+            }
+          }
+        } catch (e) {
+          this.log(`[win-mgr] error processing message from secondary: ${e?.message ?? e}`);
+        }
+      });
+      ws.on("close", () => {
+        if (registeredWindowId) {
+          const session = this.remoteWindows.get(registeredWindowId);
+          if (session) {
+            for (const [, p] of session.pendingRpcs) {
+              clearTimeout(p.timer);
+              p.reject(new Error("Secondary window disconnected"));
+            }
+          }
+          this.remoteWindows.delete(registeredWindowId);
+          this.log(`[win-mgr] secondary window disconnected: ${registeredWindowId}`);
+          this.broadcastWindows();
+        }
+      });
+      ws.on("error", (err) => {
+        this.log(`[win-mgr] secondary socket error: ${err.message}`);
+      });
+    });
+  }
+  listWindows() {
+    const list = [
+      {
+        ...this.localInfo,
+        isHost: true,
+        lastActive: Date.now()
+      }
+    ];
+    for (const session of this.remoteWindows.values()) {
+      list.push({ ...session.info, isHost: false });
+    }
+    return list;
+  }
+  broadcastWindows() {
+    this.broadcastToWeb({
+      type: "windows",
+      windows: this.listWindows()
+    });
+  }
+  broadcastRpc(action, payload = {}) {
+    for (const winId of this.remoteWindows.keys()) {
+      this.executeRpc(winId, action, payload).catch(() => {
+      });
+    }
+  }
+  async executeRpc(windowId2, action, payload) {
+    const targetId = windowId2 || this.localInfo.id;
+    if (targetId === this.localInfo.id) {
+      return this.executeLocal(action, payload);
+    }
+    const session = this.remoteWindows.get(targetId);
+    if (!session || session.ws.readyState !== wrapper_default.OPEN) {
+      this.log(`[win-mgr] window ${targetId} not found, falling back to local window`);
+      return this.executeLocal(action, payload);
+    }
+    const rpcId = `rpc_${Date.now()}_${++this.rpcCounter}`;
+    const request2 = { id: rpcId, action, payload };
+    const msg = { type: "rpc_call", request: request2 };
+    return new Promise((resolve3, reject) => {
+      const timer = setTimeout(() => {
+        session.pendingRpcs.delete(rpcId);
+        reject(new Error(`RPC timeout for action ${action} on window ${targetId}`));
+      }, 3e4);
+      session.pendingRpcs.set(rpcId, { resolve: resolve3, reject, timer });
+      session.ws.send(JSON.stringify(msg));
+    });
+  }
+  async executeLocal(action, payload = {}) {
+    switch (action) {
+      case "state":
+        return this.chat.buildState(payload.cascadeId);
+      case "trajectories":
+        return { list: await this.chat.getTrajectories() };
+      case "quota":
+        return await this.chat.getQuota() ?? {};
+      case "models":
+        return { models: await this.chat.getModels() };
+      case "screenshot": {
+        const b64 = await this.chat.captureScreenshot();
+        return b64 ? { ok: true, dataUri: `data:image/png;base64,${b64}` } : { ok: false };
+      }
+      case "new-chat":
+        await this.chat.newChat();
+        return { ok: true };
+      case "send":
+        await this.chat.sendMessage(payload.text || "", payload.images);
+        return { ok: true };
+      case "slash-command":
+        await this.chat.sendSlashCommand(
+          String(payload.name ?? ""),
+          String(payload.modelFacingText ?? ""),
+          String(payload.text ?? "")
+        );
+        return { ok: true };
+      case "mention-conversation":
+        await this.chat.sendWithConversationMention(payload.mention, String(payload.text ?? ""));
+        return { ok: true };
+      case "switch":
+        await this.chat.switchCascade(String(payload.cascadeId ?? ""));
+        return { ok: true };
+      case "select-model":
+        return { ok: await this.chat.selectModel(String(payload.modelId ?? "")) };
+      case "cancel":
+        return { ok: await this.chat.cancel() };
+      case "revert":
+        return { ok: await this.chat.revertToStep(Number(payload.stepIndex)) };
+      case "answer-question":
+        return {
+          ok: await this.chat.answerQuestion(
+            Number(payload.stepIndex),
+            Array.isArray(payload.answers) ? payload.answers : []
+          )
+        };
+      case "skip-question":
+        return { ok: await this.chat.skipQuestion(Number(payload.stepIndex)) };
+      case "slash-commands":
+        return { commands: await this.chat.getSlashCommands() };
+      case "approve-plan":
+        return {
+          ok: await this.chat.approvePlan(String(payload.artifactUri ?? ""), payload.approved !== false)
+        };
+      case "stats":
+        return this.chat.getTodayStats();
+      case "reset-stats":
+        return this.chat.resetTodayStats();
+      case "files":
+        return {
+          root: FileController.root(),
+          entries: FileController.list(payload.path ?? "")
+        };
+      case "file-read":
+        return FileController.read(payload.path ?? "");
+      case "file-write":
+        return FileController.write(String(payload.path ?? ""), String(payload.text ?? ""));
+      case "file-delete":
+        return FileController.delete(payload.path ?? "");
+      case "file-open":
+        return { ok: await FileController.openInEditor(String(payload.path ?? "")) };
+      case "file-upload": {
+        const buf = Buffer.from(payload.dataBase64 || "", "base64");
+        return FileController.saveUpload(payload.filename, buf, payload.subdir);
+      }
+      case "git/status":
+        return GitController.status();
+      case "git/log":
+        return { commits: await GitController.log(Number(payload.limit ?? 20)) };
+      case "git/diff":
+        return { diff: await GitController.diff(payload.file) };
+      case "git/add":
+        return GitController.add(payload.files ?? ".");
+      case "git/commit":
+        return GitController.commit(String(payload.message ?? ""));
+      case "git/push":
+        return GitController.push(payload.branch, payload.setUpstream);
+      case "git/pull":
+        return GitController.pull();
+      case "git/branch":
+        return { branches: await GitController.branches() };
+      case "git/branch-create":
+        return GitController.createBranch(String(payload.name ?? ""));
+      case "git/checkout":
+        return GitController.checkout(String(payload.branch ?? ""));
+      case "gh/pr-list":
+        return { prs: await GitController.listPRs() };
+      case "reload-window":
+        setTimeout(() => {
+          vscode5.commands.executeCommand("workbench.action.reloadWindow");
+        }, 150);
+        return { ok: true };
+      case "workspace":
+        return { current: SettingsController.currentWorkspace() };
+      case "workspace-folders":
+        return SettingsController.workspaceFolders();
+      case "workspace-open":
+        return SettingsController.openWorkspace(String(payload.path ?? ""));
+      case "term/list":
+        return { terminals: this.terminals.list() };
+      case "term/create":
+        return this.terminals.create(payload.cwd, payload.title);
+      case "term/input":
+        return { ok: this.terminals.write(String(payload.id ?? ""), String(payload.data ?? "")) };
+      case "term/kill":
+        return { ok: this.terminals.kill(String(payload.id ?? "")) };
+      case "term/buffer":
+        return { buffer: this.terminals.getBuffer(String(payload.id ?? "")) };
+      default:
+        throw new Error(`Unknown action: ${action}`);
+    }
+  }
+  stop() {
+    this.wss?.close();
+    this.wss = null;
+    for (const session of this.remoteWindows.values()) {
+      try {
+        session.ws.close();
+      } catch {
+      }
+    }
+    this.remoteWindows.clear();
+  }
+};
+
 // src/server.ts
 var MIME = {
   ".html": "text/html; charset=utf-8",
@@ -6697,14 +7175,23 @@ var MIME = {
   ".woff2": "font/woff2"
 };
 var RemoteServer = class {
-  constructor(opts, chat2) {
+  constructor(opts, chat2, localWindowInfo) {
     this.server = null;
     this.sseClients = /* @__PURE__ */ new Set();
-    this.unsub = null;
     this.boundPort = 0;
     this.opts = opts;
     this.chat = chat2;
-    this.terminals = new TerminalController(opts.log, (e) => this.broadcast(e));
+    this.terminals = new TerminalController(
+      opts.log,
+      (e) => this.broadcast({ ...e, windowId: localWindowInfo.id })
+    );
+    this.windowManager = new WindowManager(
+      localWindowInfo,
+      chat2,
+      this.terminals,
+      opts.log,
+      (e) => this.broadcast(e)
+    );
   }
   /** The port the server actually bound to (may differ from opts.port if it
    * was busy and we fell back to the next free port). */
@@ -6727,12 +7214,19 @@ var RemoteServer = class {
     const m = /(?:^|;\s*)arp_token=([^;]+)/.exec(cookie);
     if (m && m[1] === this.token())
       return true;
+    try {
+      const url = new import_url.URL(req.url ?? "/", `http://${req.headers.host}`);
+      const queryToken = url.searchParams.get("token");
+      if (queryToken && queryToken === this.token())
+        return true;
+    } catch {
+    }
     return false;
   }
   start() {
     const port = this.opts.port;
-    const maxAttempts = 10;
-    const retryDelayMs = 400;
+    const maxAttempts = 5;
+    const retryDelayMs = 300;
     const attempt = (n) => new Promise((resolve3, reject) => {
       const server2 = http3.createServer(
         (req, res) => this.handle(req, res).catch((e) => {
@@ -6754,7 +7248,7 @@ var RemoteServer = class {
         } else if (err.code === "EADDRINUSE") {
           reject(
             new Error(
-              `port ${port} is still in use after ${maxAttempts} attempts. Run "Antigravity Remote Plus: Stop" (or reload the window) to release it.`
+              `port ${port} is still in use after ${maxAttempts} attempts.`
             )
           );
         } else {
@@ -6766,11 +7260,11 @@ var RemoteServer = class {
         server2.removeListener("error", onError);
         this.server = server2;
         this.boundPort = port;
+        this.windowManager.attachWebSocketServer(server2, (req) => this.isAuthed(req));
         server2.on(
           "error",
           (e) => this.opts.log(`[server] runtime error: ${e.message}`)
         );
-        this.unsub = this.chat.onEvent((e) => this.broadcast(e));
         this.opts.log(`[server] listening on http://${this.opts.host}:${port}`);
         resolve3();
       });
@@ -6778,7 +7272,7 @@ var RemoteServer = class {
     return attempt(1);
   }
   stop() {
-    this.unsub?.();
+    this.windowManager.stop();
     for (const c of this.sseClients) {
       try {
         c.end();
@@ -6876,8 +7370,17 @@ var RemoteServer = class {
     return { fields, files };
   }
   async handle(req, res) {
-    const url = new import_url.URL(req.url ?? "/", `http://${req.headers.host}`);
+    const host = req.headers.host || "127.0.0.1";
+    let url;
+    try {
+      url = new import_url.URL(req.url ?? "/", `http://${host}`);
+    } catch {
+      url = new import_url.URL("/", "http://127.0.0.1");
+    }
     const pathName = url.pathname;
+    if (pathName === "/api/health") {
+      return this.json(res, 200, { ok: true, activePort: this.activePort });
+    }
     if (pathName === "/api/login" && req.method === "POST") {
       const body = await this.readJson(req);
       if (!this.opts.password || body.password === this.opts.password) {
@@ -6890,6 +7393,23 @@ var RemoteServer = class {
         this.json(res, 401, { error: "wrong password" });
       }
       return;
+    }
+    if (pathName === "/api/reload-window" && req.method === "POST") {
+      const addr = req.socket.remoteAddress || "";
+      const isLocal = addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || this.isAuthed(req);
+      if (!isLocal) {
+        return this.json(res, 401, { error: "unauthorized" });
+      }
+      try {
+        if (typeof this.windowManager.broadcastRpc === "function") {
+          this.windowManager.broadcastRpc("reload-window", {});
+        }
+      } catch {
+      }
+      setTimeout(() => {
+        vscode6.commands.executeCommand("workbench.action.reloadWindow");
+      }, 150);
+      return this.json(res, 200, { ok: true });
     }
     if (pathName.startsWith("/api/")) {
       if (!this.isAuthed(req)) {
@@ -6913,252 +7433,257 @@ var RemoteServer = class {
 `);
       this.sseClients.add(res);
       req.on("close", () => this.sseClients.delete(res));
-      this.chat.buildState().then((state) => {
-        res.write(`data: ${JSON.stringify({ type: "state", state })}
+      res.write(
+        `data: ${JSON.stringify({
+          type: "windows",
+          windows: this.windowManager.listWindows()
+        })}
 
-`);
+`
+      );
+      this.chat.buildState().then((state) => {
+        res.write(
+          `data: ${JSON.stringify({
+            type: "state",
+            windowId: this.windowManager.getLocalWindowId(),
+            state
+          })}
+
+`
+        );
       });
       return;
     }
+    if (route === "windows") {
+      return this.json(res, 200, { windows: this.windowManager.listWindows() });
+    }
+    if (route === "reload-window" && req.method === "POST") {
+      this.windowManager.broadcastRpc("reload-window", {});
+      setTimeout(() => {
+        vscode6.commands.executeCommand("workbench.action.reloadWindow");
+      }, 150);
+      return this.json(res, 200, { ok: true });
+    }
+    let windowId2 = url.searchParams.get("windowId") || req.headers["x-window-id"] || void 0;
+    const rpc = async (action, payload) => {
+      try {
+        const result = await this.windowManager.executeRpc(windowId2, action, payload);
+        return this.json(res, 200, result);
+      } catch (e) {
+        return this.json(res, 500, { ok: false, error: e?.message ?? e });
+      }
+    };
     switch (route) {
       case "state": {
-        const id = url.searchParams.get("cascadeId") ?? void 0;
-        return this.json(res, 200, await this.chat.buildState(id));
+        const cascadeId = url.searchParams.get("cascadeId") ?? void 0;
+        return rpc("state", { cascadeId });
       }
       case "trajectories":
-        return this.json(res, 200, { list: await this.chat.getTrajectories() });
+        return rpc("trajectories");
       case "quota":
-        return this.json(res, 200, await this.chat.getQuota() ?? {});
+        return rpc("quota");
       case "models":
-        return this.json(res, 200, { models: await this.chat.getModels() });
-      case "screenshot": {
-        const b64 = await this.chat.captureScreenshot();
-        if (!b64)
-          return this.json(res, 200, { ok: false });
-        return this.json(res, 200, { ok: true, dataUri: `data:image/png;base64,${b64}` });
-      }
+        return rpc("models");
+      case "screenshot":
+        return rpc("screenshot");
       case "new-chat":
-        await this.chat.newChat();
-        return this.json(res, 200, { ok: true });
+        return rpc("new-chat");
       case "send": {
         const body = await this.readJson(req);
-        const text = String(body.text || "");
-        const images = Array.isArray(body.images) ? body.images : void 0;
-        await this.chat.sendMessage(text, images);
-        return this.json(res, 200, { ok: true });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("send", {
+          text: String(body.text || ""),
+          images: Array.isArray(body.images) ? body.images : void 0
+        });
       }
       case "slash-command": {
         const body = await this.readJson(req);
-        await this.chat.sendSlashCommand(
-          String(body.name ?? ""),
-          String(body.modelFacingText ?? ""),
-          String(body.text ?? "")
-        );
-        return this.json(res, 200, { ok: true });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("slash-command", {
+          name: body.name,
+          modelFacingText: body.modelFacingText,
+          text: body.text
+        });
       }
       case "mention-conversation": {
         const body = await this.readJson(req);
-        await this.chat.sendWithConversationMention(
-          {
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("mention-conversation", {
+          mention: {
             id: String(body.id ?? ""),
             title: body.title ? String(body.title) : void 0,
             lastModifiedTime: body.lastModifiedTime ? String(body.lastModifiedTime) : void 0
           },
-          String(body.text ?? "")
-        );
-        return this.json(res, 200, { ok: true });
+          text: String(body.text ?? "")
+        });
       }
       case "switch": {
         const body = await this.readJson(req);
-        await this.chat.switchCascade(String(body.cascadeId ?? ""));
-        return this.json(res, 200, { ok: true });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("switch", { cascadeId: body.cascadeId });
       }
       case "select-model": {
         const body = await this.readJson(req);
-        const ok = await this.chat.selectModel(String(body.modelId ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("select-model", { modelId: body.modelId });
       }
       case "cancel":
-        return this.json(res, 200, { ok: await this.chat.cancel() });
+        return rpc("cancel");
       case "revert": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.revertToStep(stepIndex);
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("revert", { stepIndex: body.stepIndex });
       }
       case "answer-question": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        const answers = Array.isArray(body.answers) ? body.answers : [];
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.answerQuestion(
-          stepIndex,
-          answers.map((a) => ({
-            selectedOptionIds: Array.isArray(a?.selectedOptionIds) ? a.selectedOptionIds.map(String) : [],
-            freeText: a?.freeText ? String(a.freeText) : void 0
-          }))
-        );
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("answer-question", {
+          stepIndex: body.stepIndex,
+          answers: body.answers
+        });
       }
       case "skip-question": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.skipQuestion(stepIndex);
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("skip-question", { stepIndex: body.stepIndex });
       }
       case "slash-commands":
-        return this.json(res, 200, {
-          commands: await this.chat.getSlashCommands()
-        });
+        return rpc("slash-commands");
       case "approve-plan": {
         const body = await this.readJson(req);
-        const artifactUri = String(body.artifactUri ?? "");
-        if (!artifactUri) {
-          return this.json(res, 400, { ok: false, error: "artifactUri required" });
-        }
-        const ok = await this.chat.approvePlan(
-          artifactUri,
-          body.approved !== false
-        );
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("approve-plan", {
+          artifactUri: body.artifactUri,
+          approved: body.approved
+        });
       }
+      case "stats":
+        return rpc("stats");
+      case "reset-stats":
+        return rpc("reset-stats");
       case "files": {
         const rel = url.searchParams.get("path") ?? "";
-        return this.json(res, 200, {
-          root: FileController.root(),
-          entries: FileController.list(rel)
-        });
+        return rpc("files", { path: rel });
       }
       case "file": {
         if (req.method === "GET") {
           const rel = url.searchParams.get("path") ?? "";
-          return this.json(res, 200, FileController.read(rel));
+          return rpc("file-read", { path: rel });
         }
         if (req.method === "PUT" || req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            FileController.write(String(body.path ?? ""), String(body.text ?? ""))
-          );
+          if (body.windowId)
+            windowId2 = body.windowId;
+          return rpc("file-write", { path: body.path, text: body.text });
         }
         if (req.method === "DELETE") {
           const rel = url.searchParams.get("path") ?? "";
-          return this.json(res, 200, FileController.delete(rel));
+          return rpc("file-delete", { path: rel });
         }
         break;
       }
       case "file-open": {
         const body = await this.readJson(req);
-        const ok = await FileController.openInEditor(String(body.path ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("file-open", { path: body.path });
       }
       case "upload": {
         const ct = String(req.headers["content-type"] ?? "");
         const buf = await this.readBody(req);
-        const { files } = this.parseMultipart(buf, ct);
+        const { fields, files } = this.parseMultipart(buf, ct);
+        const targetWinId = fields.windowId || windowId2;
         const saved = [];
         const absPaths = [];
         for (const f of files) {
-          const r = FileController.saveUpload(f.filename, f.data);
-          if ("path" in r) {
-            saved.push(r.path);
-            absPaths.push(r.abs);
+          try {
+            const res2 = await this.windowManager.executeRpc(targetWinId, "file-upload", {
+              filename: f.filename,
+              dataBase64: f.data.toString("base64"),
+              subdir: fields.subdir || "uploads"
+            });
+            if (res2 && "path" in res2) {
+              saved.push(res2.path);
+              absPaths.push(res2.abs);
+            }
+          } catch (e) {
+            this.opts.log(`[upload] error saving file to window ${targetWinId}: ${e?.message ?? e}`);
           }
         }
         return this.json(res, 200, { saved, absPaths });
       }
       case "git/status":
-        return this.json(res, 200, await GitController.status());
-      case "git/log":
-        return this.json(res, 200, {
-          commits: await GitController.log(
-            Number(url.searchParams.get("limit") ?? 20)
-          )
-        });
+        return rpc("git/status");
+      case "git/log": {
+        const limit = Number(url.searchParams.get("limit") ?? 20);
+        return rpc("git/log", { limit });
+      }
       case "git/diff": {
         const file = url.searchParams.get("file") ?? void 0;
-        return this.json(res, 200, { diff: await GitController.diff(file) });
+        return rpc("git/diff", { file });
       }
       case "git/add": {
         const body = await this.readJson(req);
-        return this.json(res, 200, await GitController.add(body.files ?? "."));
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("git/add", { files: body.files });
       }
       case "git/commit": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.commit(String(body.message ?? ""))
-        );
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("git/commit", { message: body.message });
       }
       case "git/push": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.push(body.branch, body.setUpstream)
-        );
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("git/push", { branch: body.branch, setUpstream: body.setUpstream });
       }
       case "git/pull":
-        return this.json(res, 200, await GitController.pull());
-      case "git/branch":
+        return rpc("git/pull");
+      case "git/branch": {
         if (req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            await GitController.createBranch(String(body.name ?? ""))
-          );
+          if (body.windowId)
+            windowId2 = body.windowId;
+          return rpc("git/branch-create", { name: body.name });
         }
-        return this.json(res, 200, { branches: await GitController.branches() });
+        return rpc("git/branch");
+      }
       case "git/checkout": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.checkout(String(body.branch ?? ""))
-        );
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("git/checkout", { branch: body.branch });
       }
       case "gh/pr-create": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.createPR(
-            String(body.title ?? ""),
-            String(body.body ?? "")
-          )
-        );
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("gh/pr-create", { title: body.title, body: body.body });
       }
       case "gh/pr-list":
-        return this.json(res, 200, { prs: await GitController.listPRs() });
-      case "stats": {
-        const stats = this.chat.getTodayStats();
-        return this.json(res, 200, stats);
-      }
-      case "reset-stats": {
-        const stats = this.chat.resetTodayStats();
-        return this.json(res, 200, stats);
-      }
+        return rpc("gh/pr-list");
       case "media": {
         const u = new import_url.URL(req.url ?? "", "http://localhost");
         let filePath = u.searchParams.get("path") || "";
         if (filePath.startsWith("file://")) {
           filePath = decodeURIComponent(filePath.replace(/^file:\/\//, ""));
         }
-        if (!filePath || !fs5.existsSync(filePath)) {
+        if (!filePath || !fs6.existsSync(filePath)) {
           return this.json(res, 404, { error: "file not found" });
         }
-        let ext = path4.extname(filePath).toLowerCase();
+        let ext = path5.extname(filePath).toLowerCase();
         let contentType = "image/png";
         if (ext === ".jpg" || ext === ".jpeg")
           contentType = "image/jpeg";
@@ -7171,9 +7696,9 @@ var RemoteServer = class {
         else {
           try {
             const buf = Buffer.alloc(8);
-            const fd = fs5.openSync(filePath, "r");
-            fs5.readSync(fd, buf, 0, 8, 0);
-            fs5.closeSync(fd);
+            const fd = fs6.openSync(filePath, "r");
+            fs6.readSync(fd, buf, 0, 8, 0);
+            fs6.closeSync(fd);
             if (buf[0] === 255 && buf[1] === 216)
               contentType = "image/jpeg";
             else if (buf[0] === 137 && buf[1] === 80)
@@ -7191,7 +7716,7 @@ var RemoteServer = class {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, OPTIONS"
         });
-        fs5.createReadStream(filePath).pipe(res);
+        fs6.createReadStream(filePath).pipe(res);
         return;
       }
       case "account":
@@ -7215,17 +7740,13 @@ var RemoteServer = class {
       }
       case "workspace": {
         if (req.method === "GET") {
-          return this.json(res, 200, {
-            current: SettingsController.currentWorkspace()
-          });
+          return rpc("workspace");
         }
         if (req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            await SettingsController.openWorkspace(String(body.path ?? ""))
-          );
+          if (body.windowId)
+            windowId2 = body.windowId;
+          return rpc("workspace-open", { path: body.path });
         }
         break;
       }
@@ -7234,7 +7755,7 @@ var RemoteServer = class {
         return this.json(res, 200, SettingsController.browse(dir));
       }
       case "workspace-folders":
-        return this.json(res, 200, SettingsController.workspaceFolders());
+        return rpc("workspace-folders");
       case "workspace-create": {
         if (req.method === "POST") {
           const body = await this.readJson(req);
@@ -7245,10 +7766,10 @@ var RemoteServer = class {
             const root = SettingsController.get().workspaceRoot;
             if (!root)
               throw new Error("Workspace root not configured");
-            const target = path4.join(root, name);
+            const target = path5.join(root, name);
             if (!target.startsWith(root))
               throw new Error("Invalid name");
-            fs5.mkdirSync(target, { recursive: true });
+            fs6.mkdirSync(target, { recursive: true });
             return this.json(res, 200, { ok: true, path: target });
           } catch (e) {
             return this.json(res, 500, { ok: false, error: e.message });
@@ -7257,28 +7778,28 @@ var RemoteServer = class {
         break;
       }
       case "term/list":
-        return this.json(res, 200, { terminals: this.terminals.list() });
+        return rpc("term/list");
       case "term/create": {
         const body = await this.readJson(req);
-        const info = this.terminals.create(
-          body.cwd ? String(body.cwd) : void 0,
-          body.title ? String(body.title) : void 0
-        );
-        return this.json(res, 200, info);
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("term/create", { cwd: body.cwd, title: body.title });
       }
       case "term/input": {
         const body = await this.readJson(req);
-        const ok = this.terminals.write(String(body.id ?? ""), String(body.data ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("term/input", { id: body.id, data: body.data });
       }
       case "term/kill": {
         const body = await this.readJson(req);
-        const ok = this.terminals.kill(String(body.id ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId)
+          windowId2 = body.windowId;
+        return rpc("term/kill", { id: body.id });
       }
       case "term/buffer": {
         const id = url.searchParams.get("id") ?? "";
-        return this.json(res, 200, { buffer: this.terminals.getBuffer(id) });
+        return rpc("term/buffer", { id });
       }
     }
     this.json(res, 404, { error: "not found" });
@@ -7286,16 +7807,16 @@ var RemoteServer = class {
   serveStatic(pathName, res) {
     let rel = pathName === "/" ? "/index.html" : pathName;
     rel = rel.split("?")[0];
-    const abs = path4.join(this.opts.webRoot, rel);
+    const abs = path5.join(this.opts.webRoot, rel);
     if (!abs.startsWith(this.opts.webRoot)) {
       res.writeHead(403);
       res.end("forbidden");
       return;
     }
-    fs5.readFile(abs, (err, data) => {
+    fs6.readFile(abs, (err, data) => {
       if (err) {
-        const indexPath = path4.join(this.opts.webRoot, "index.html");
-        fs5.readFile(indexPath, (err2, idx) => {
+        const indexPath = path5.join(this.opts.webRoot, "index.html");
+        fs6.readFile(indexPath, (err2, idx) => {
           if (err2) {
             res.writeHead(404);
             res.end("not found");
@@ -7306,7 +7827,7 @@ var RemoteServer = class {
         });
         return;
       }
-      const ext = path4.extname(abs).toLowerCase();
+      const ext = path5.extname(abs).toLowerCase();
       res.writeHead(200, {
         "Content-Type": MIME[ext] ?? "application/octet-stream"
       });
@@ -7317,8 +7838,8 @@ var RemoteServer = class {
 
 // src/telegram.ts
 var https2 = __toESM(require("https"));
-var fs6 = __toESM(require("fs"));
-var path5 = __toESM(require("path"));
+var fs7 = __toESM(require("fs"));
+var path6 = __toESM(require("path"));
 var TG_LIMIT = 3900;
 function api(token, method, body) {
   const payload = JSON.stringify(body ?? {});
@@ -7725,9 +8246,9 @@ G\u1EEDi tin nh\u1EAFn \u0111\u1EC3 chat v\u1EDBi AI, ho\u1EB7c /help \u0111\u1E
   async sendFile(chatId, rawPath) {
     const filePath = rawPath.replace(/^file:\/\//, "");
     let data = null;
-    if (path5.isAbsolute(filePath) && fs6.existsSync(filePath)) {
+    if (path6.isAbsolute(filePath) && fs7.existsSync(filePath)) {
       try {
-        data = fs6.readFileSync(filePath);
+        data = fs7.readFileSync(filePath);
       } catch {
         data = null;
       }
@@ -8171,6 +8692,266 @@ function assistantKey(text) {
   return `${text.length}:${text.slice(0, 150)}:${text.slice(-150)}`;
 }
 
+// src/windowClient.ts
+var vscode7 = __toESM(require("vscode"));
+var WindowClient = class {
+  constructor(opts, chat2, terminals2) {
+    this.ws = null;
+    this.heartbeatTimer = null;
+    this.isConnected = false;
+    this.intentionalClose = false;
+    this.opts = opts;
+    this.chat = chat2;
+    this.terminals = terminals2;
+    this.chat.onEvent((e) => {
+      if (e.type === "state" && e.state) {
+        this.opts.windowInfo.activeCascadeId = e.state.cascadeId;
+        this.opts.windowInfo.isGenerating = !!e.state.generating;
+        this.opts.windowInfo.statusText = e.state.statusText || "Idle";
+      } else if (e.type === "state_update" || e.type === "status") {
+        this.opts.windowInfo.isGenerating = !!e.generating;
+        this.opts.windowInfo.statusText = e.statusText || "Idle";
+      }
+      this.sendEvent(e);
+    });
+  }
+  connect() {
+    return new Promise((resolve3, reject) => {
+      const url = `ws://127.0.0.1:${this.opts.port}/api/ide-ws?token=${encodeURIComponent(
+        this.opts.token
+      )}`;
+      const ws = new wrapper_default(url, {
+        headers: { Authorization: `Bearer ${this.opts.token}` }
+      });
+      this.ws = ws;
+      const connectionTimeout = setTimeout(() => {
+        if (!this.isConnected) {
+          ws.close();
+          reject(new Error("Connection to Host timed out"));
+        }
+      }, 5e3);
+      ws.on("open", () => {
+        this.isConnected = true;
+        clearTimeout(connectionTimeout);
+        this.opts.log(`[win-client] connected to Host server on port ${this.opts.port}`);
+        const regMsg = {
+          type: "register",
+          window: this.opts.windowInfo
+        };
+        ws.send(JSON.stringify(regMsg));
+        this.startHeartbeat();
+        resolve3();
+      });
+      ws.on("message", async (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString("utf8"));
+          if (msg.type === "rpc_call") {
+            await this.handleRpc(msg.request);
+          }
+        } catch (e) {
+          this.opts.log(`[win-client] error handling message: ${e?.message ?? e}`);
+        }
+      });
+      ws.on("close", () => {
+        this.isConnected = false;
+        this.stopHeartbeat();
+        this.opts.log("[win-client] disconnected from Host server");
+        if (!this.intentionalClose) {
+          this.opts.onHostDisconnected();
+        }
+      });
+      ws.on("error", (err) => {
+        this.opts.log(`[win-client] socket error: ${err.message}`);
+        if (!this.isConnected) {
+          clearTimeout(connectionTimeout);
+          reject(err);
+        }
+      });
+    });
+  }
+  sendEvent(event) {
+    if (this.ws && this.ws.readyState === wrapper_default.OPEN) {
+      const msg = {
+        type: "event",
+        windowId: this.opts.windowInfo.id,
+        event
+      };
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === wrapper_default.OPEN) {
+        const msg = {
+          type: "heartbeat",
+          windowId: this.opts.windowInfo.id,
+          isGenerating: this.opts.windowInfo.isGenerating,
+          statusText: this.opts.windowInfo.statusText,
+          activeCascadeId: this.opts.windowInfo.activeCascadeId
+        };
+        this.ws.send(JSON.stringify(msg));
+      }
+    }, 5e3);
+  }
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+  async handleRpc(req) {
+    let response;
+    try {
+      const data = await this.executeAction(req.action, req.payload);
+      response = { id: req.id, ok: true, data };
+    } catch (e) {
+      response = { id: req.id, ok: false, error: e?.message ?? String(e) };
+    }
+    if (this.ws && this.ws.readyState === wrapper_default.OPEN) {
+      const msg = {
+        type: "rpc_result",
+        response
+      };
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+  async executeAction(action, payload = {}) {
+    switch (action) {
+      case "state":
+        return this.chat.buildState(payload.cascadeId);
+      case "trajectories":
+        return { list: await this.chat.getTrajectories() };
+      case "quota":
+        return await this.chat.getQuota() ?? {};
+      case "models":
+        return { models: await this.chat.getModels() };
+      case "screenshot": {
+        const b64 = await this.chat.captureScreenshot();
+        return b64 ? { ok: true, dataUri: `data:image/png;base64,${b64}` } : { ok: false };
+      }
+      case "new-chat":
+        await this.chat.newChat();
+        return { ok: true };
+      case "send":
+        await this.chat.sendMessage(payload.text || "", payload.images);
+        return { ok: true };
+      case "slash-command":
+        await this.chat.sendSlashCommand(
+          String(payload.name ?? ""),
+          String(payload.modelFacingText ?? ""),
+          String(payload.text ?? "")
+        );
+        return { ok: true };
+      case "mention-conversation":
+        await this.chat.sendWithConversationMention(payload.mention, String(payload.text ?? ""));
+        return { ok: true };
+      case "switch":
+        await this.chat.switchCascade(String(payload.cascadeId ?? ""));
+        return { ok: true };
+      case "select-model":
+        return { ok: await this.chat.selectModel(String(payload.modelId ?? "")) };
+      case "cancel":
+        return { ok: await this.chat.cancel() };
+      case "revert":
+        return { ok: await this.chat.revertToStep(Number(payload.stepIndex)) };
+      case "answer-question":
+        return {
+          ok: await this.chat.answerQuestion(
+            Number(payload.stepIndex),
+            Array.isArray(payload.answers) ? payload.answers : []
+          )
+        };
+      case "skip-question":
+        return { ok: await this.chat.skipQuestion(Number(payload.stepIndex)) };
+      case "slash-commands":
+        return { commands: await this.chat.getSlashCommands() };
+      case "approve-plan":
+        return {
+          ok: await this.chat.approvePlan(String(payload.artifactUri ?? ""), payload.approved !== false)
+        };
+      case "stats":
+        return this.chat.getTodayStats();
+      case "reset-stats":
+        return this.chat.resetTodayStats();
+      case "files":
+        return {
+          root: FileController.root(),
+          entries: FileController.list(payload.path ?? "")
+        };
+      case "file-read":
+        return FileController.read(payload.path ?? "");
+      case "file-write":
+        return FileController.write(String(payload.path ?? ""), String(payload.text ?? ""));
+      case "file-delete":
+        return FileController.delete(payload.path ?? "");
+      case "file-open":
+        return { ok: await FileController.openInEditor(String(payload.path ?? "")) };
+      case "file-upload": {
+        const buf = Buffer.from(payload.dataBase64 || "", "base64");
+        return FileController.saveUpload(payload.filename, buf, payload.subdir);
+      }
+      case "git/status":
+        return GitController.status();
+      case "git/log":
+        return { commits: await GitController.log(Number(payload.limit ?? 20)) };
+      case "git/diff":
+        return { diff: await GitController.diff(payload.file) };
+      case "git/add":
+        return GitController.add(payload.files ?? ".");
+      case "git/commit":
+        return GitController.commit(String(payload.message ?? ""));
+      case "git/push":
+        return GitController.push(payload.branch, payload.setUpstream);
+      case "git/pull":
+        return GitController.pull();
+      case "git/branch":
+        return { branches: await GitController.branches() };
+      case "git/branch-create":
+        return GitController.createBranch(String(payload.name ?? ""));
+      case "git/checkout":
+        return GitController.checkout(String(payload.branch ?? ""));
+      case "gh/pr-create":
+        return GitController.createPR(String(payload.title ?? ""), String(payload.body ?? ""));
+      case "gh/pr-list":
+      case "reload-window":
+        setTimeout(() => {
+          vscode7.commands.executeCommand("workbench.action.reloadWindow");
+        }, 150);
+        return { ok: true };
+      case "workspace":
+        return { current: SettingsController.currentWorkspace() };
+      case "workspace-folders":
+        return SettingsController.workspaceFolders();
+      case "workspace-open":
+        return SettingsController.openWorkspace(String(payload.path ?? ""));
+      case "term/list":
+        return { terminals: this.terminals.list() };
+      case "term/create":
+        return this.terminals.create(payload.cwd, payload.title);
+      case "term/input":
+        return { ok: this.terminals.write(String(payload.id ?? ""), String(payload.data ?? "")) };
+      case "term/kill":
+        return { ok: this.terminals.kill(String(payload.id ?? "")) };
+      case "term/buffer":
+        return { buffer: this.terminals.getBuffer(String(payload.id ?? "")) };
+      default:
+        throw new Error(`Unknown action on secondary window: ${action}`);
+    }
+  }
+  stop() {
+    this.intentionalClose = true;
+    this.stopHeartbeat();
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+      }
+      this.ws = null;
+    }
+  }
+};
+
 // src/extension.ts
 var CFG2 = "antigravityRemotePlus";
 var output;
@@ -8178,17 +8959,21 @@ var statusBar;
 var ls = null;
 var chat = null;
 var server = null;
+var client = null;
+var terminals = null;
 var telegram = null;
 var running = false;
+var isHost = false;
+var windowId = `win_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 function log(msg) {
   const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${msg}`;
   output?.appendLine(line);
 }
 function cfg(key, fallback) {
-  return vscode5.workspace.getConfiguration(CFG2).get(key, fallback);
+  return vscode8.workspace.getConfiguration(CFG2).get(key, fallback);
 }
 function lanIps() {
-  const nets = os4.networkInterfaces();
+  const nets = os5.networkInterfaces();
   const ips = [];
   for (const name of Object.keys(nets)) {
     for (const ni of nets[name] ?? []) {
@@ -8198,16 +8983,56 @@ function lanIps() {
   }
   return ips;
 }
+function getLocalWindowInfo() {
+  const wsFolders = (vscode8.workspace.workspaceFolders || []).map((f) => ({
+    name: f.name,
+    path: f.uri.fsPath
+  }));
+  const wsName = vscode8.workspace.name || wsFolders[0]?.name || "Workspace";
+  const wsPath = wsFolders[0]?.path || null;
+  return {
+    id: windowId,
+    title: wsName,
+    workspaceName: wsName,
+    workspacePath: wsPath,
+    workspaceFolders: wsFolders,
+    isGenerating: false,
+    statusText: "Idle",
+    pid: process.pid,
+    isHost: false,
+    lastActive: Date.now()
+  };
+}
+function checkServerHealth(port) {
+  return new Promise((resolve3) => {
+    const req = http4.get(
+      `http://127.0.0.1:${port}/api/health`,
+      { timeout: 600 },
+      (res) => {
+        if (res.statusCode === 200) {
+          resolve3(true);
+        } else {
+          resolve3(false);
+        }
+      }
+    );
+    req.on("error", () => resolve3(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve3(false);
+    });
+  });
+}
 async function startAll(context) {
   if (running) {
-    vscode5.window.showInformationMessage("Antigravity Remote Plus already running.");
+    vscode8.window.showInformationMessage("Antigravity Remote Plus already running.");
     return;
   }
   const port = cfg("port", 7377);
   const host = cfg("bindHost", "0.0.0.0");
   const password = cfg("password", "Maiyeu3m");
   if (host === "0.0.0.0" && !password) {
-    vscode5.window.showErrorMessage(
+    vscode8.window.showErrorMessage(
       "Refusing to bind to 0.0.0.0 without a password. Set antigravityRemotePlus.password."
     );
     return;
@@ -8223,90 +9048,146 @@ async function startAll(context) {
       "[ext] CDP not attached \u2014 IDE not started with --remote-debugging-port. Run 'Antigravity Remote Plus: Relaunch IDE with Remote Debug' to enable IDE\u21C4web sync."
     );
   }
-  const webRoot = path6.join(context.extensionPath, "media", "web");
-  server = new RemoteServer(
+  const windowInfo = getLocalWindowInfo();
+  const isServerRunning = await checkServerHealth(port);
+  if (!isServerRunning) {
+    log(`[ext] starting as Primary Host on port ${port}\u2026`);
+    windowInfo.isHost = true;
+    const webRoot = path7.join(context.extensionPath, "media", "web");
+    server = new RemoteServer(
+      {
+        port,
+        host,
+        password,
+        webRoot,
+        log,
+        onSettingsChanged: () => {
+          log("[ext] settings changed via web UI \u2014 restarting\u2026");
+          setTimeout(() => {
+            stopAll();
+            startAll(context).catch(
+              (e) => log(`[ext] restart after settings change: ${e}`)
+            );
+          }, 400);
+        }
+      },
+      chat,
+      windowInfo
+    );
+    try {
+      await server.start();
+      isHost = true;
+      running = true;
+    } catch (e) {
+      log(`[ext] host server start failed: ${e?.message ?? e}`);
+      server = null;
+      const fallbackRunning = await checkServerHealth(port);
+      if (fallbackRunning) {
+        log("[ext] another instance bound the port; falling back to Secondary client");
+        await startSecondary(port, host, password, windowInfo, context);
+        return;
+      }
+      chat.stop();
+      running = false;
+      isHost = false;
+      updateStatusBar();
+      vscode8.window.showErrorMessage(`Failed to start server on ${host}:${port} \u2014 ${e?.message ?? e}`);
+      return;
+    }
+    if (cfg("telegramEnabled", false)) {
+      const token = cfg("telegramToken", "");
+      const chatId = cfg("telegramChatId", "");
+      if (token) {
+        telegram = new TelegramBridge({ token, chatId, log }, chat);
+        await telegram.start();
+      } else {
+        log("[ext] telegram enabled but no token set");
+      }
+    }
+    updateStatusBar();
+    const activePort = server.activePort;
+    const lan = host === "0.0.0.0" ? lanIps() : [];
+    const urls = [
+      `http://127.0.0.1:${activePort}`,
+      ...lan.map((ip) => `http://${ip}:${activePort}`)
+    ];
+    log(`[ext] Host started. URLs: ${urls.join(", ")}`);
+    const primary = lan.length > 0 ? `http://${lan[0]}:${activePort}` : urls[0];
+    const msg = lan.length > 0 ? `Antigravity Remote Plus [Host] on LAN: ${primary}` : `Antigravity Remote Plus [Host] running on ${primary}`;
+    const actions = lan.length > 0 ? ["Open Web UI", "Copy LAN URL"] : ["Open Web UI"];
+    vscode8.window.showInformationMessage(msg, ...actions).then((choice) => {
+      if (choice === "Open Web UI")
+        openWeb();
+      else if (choice === "Copy LAN URL") {
+        vscode8.env.clipboard.writeText(primary);
+        vscode8.window.showInformationMessage(`Copied: ${primary}`);
+      }
+    });
+  } else {
+    await startSecondary(port, host, password, windowInfo, context);
+  }
+}
+async function startSecondary(port, host, password, windowInfo, context) {
+  log(`[ext] existing Host detected on port ${port}; connecting as Secondary Node\u2026`);
+  const token = crypto2.createHmac("sha256", "antigravity-remote-plus/v1").update(password).digest("hex");
+  terminals = new TerminalController(log, () => {
+  });
+  client = new WindowClient(
     {
       port,
       host,
-      password,
-      webRoot,
+      token,
+      windowInfo,
       log,
-      // When settings change via the web UI, restart everything so the new
-      // port/password/host/telegram config takes effect immediately.
-      onSettingsChanged: () => {
-        log("[ext] settings changed via web UI \u2014 restarting\u2026");
-        setTimeout(() => {
+      onHostDisconnected: () => {
+        log("[ext] Host disconnected \u2014 preparing failover election\u2026");
+        if (running && !isHost) {
           stopAll();
-          startAll(context).catch(
-            (e) => log(`[ext] restart after settings change: ${e}`)
-          );
-        }, 400);
+          const delay3 = 300 + Math.floor(Math.random() * 600);
+          setTimeout(() => {
+            startAll(context).catch((e) => log(`[ext] failover start: ${e}`));
+          }, delay3);
+        }
       }
     },
-    chat
+    chat,
+    terminals
   );
   try {
-    await server.start();
-  } catch (e) {
-    vscode5.window.showErrorMessage(
-      `Failed to start server on ${host}:${port} \u2014 ${e?.message ?? e}`
+    await client.connect();
+    isHost = false;
+    running = true;
+    updateStatusBar();
+    log(`[ext] Secondary connected successfully to Host (windowId=${windowInfo.id})`);
+    vscode8.window.showInformationMessage(
+      `Antigravity Remote Plus: Connected to Host server on port ${port} (${windowInfo.title})`
     );
-    log(`[ext] server start failed: ${e?.message ?? e}`);
-    server = null;
-    chat.stop();
+  } catch (e) {
+    log(`[ext] failed to connect to Host: ${e?.message ?? e}`);
+    client = null;
+    chat?.stop();
     running = false;
     updateStatusBar();
-    return;
   }
-  if (cfg("telegramEnabled", false)) {
-    const token = cfg("telegramToken", "");
-    const chatId = cfg("telegramChatId", "");
-    if (token) {
-      telegram = new TelegramBridge({ token, chatId, log }, chat);
-      await telegram.start();
-    } else {
-      log("[ext] telegram enabled but no token set");
-    }
-  }
-  running = true;
-  updateStatusBar();
-  const activePort = server.activePort;
-  if (activePort !== port) {
-    log(`[ext] requested port ${port} was busy; bound to ${activePort} instead`);
-  }
-  const lan = host === "0.0.0.0" ? lanIps() : [];
-  const urls = [
-    `http://127.0.0.1:${activePort}`,
-    ...lan.map((ip) => `http://${ip}:${activePort}`)
-  ];
-  log(`[ext] started. URLs: ${urls.join(", ")}`);
-  const primary = lan.length > 0 ? `http://${lan[0]}:${activePort}` : urls[0];
-  const msg = lan.length > 0 ? `Antigravity Remote Plus on LAN: ${primary}  (password required)` : `Antigravity Remote Plus running on ${primary}`;
-  const actions = lan.length > 0 ? ["Open Web UI", "Copy LAN URL"] : ["Open Web UI"];
-  vscode5.window.showInformationMessage(msg, ...actions).then((choice) => {
-    if (choice === "Open Web UI")
-      openWeb();
-    else if (choice === "Copy LAN URL") {
-      vscode5.env.clipboard.writeText(primary);
-      vscode5.window.showInformationMessage(`Copied: ${primary}`);
-    }
-  });
 }
 function stopAll() {
   telegram?.stop();
   telegram = null;
   server?.stop();
   server = null;
+  client?.stop();
+  client = null;
   chat?.stop();
   chat = null;
   ls = null;
   running = false;
+  isHost = false;
   updateStatusBar();
   log("[ext] stopped");
 }
 function openWeb() {
   const port = server?.activePort ?? cfg("port", 7377);
-  vscode5.env.openExternal(vscode5.Uri.parse(`http://127.0.0.1:${port}`));
+  vscode8.env.openExternal(vscode8.Uri.parse(`http://127.0.0.1:${port}`));
 }
 function showInfo() {
   const port = server?.activePort ?? cfg("port", 7377);
@@ -8315,8 +9196,9 @@ function showInfo() {
     `http://127.0.0.1:${port}`,
     ...host === "0.0.0.0" ? lanIps().map((ip) => `http://${ip}:${port}`) : []
   ];
-  vscode5.window.showInformationMessage(
-    `${running ? "Running" : "Stopped"} \u2014 ${urls.join("  ")} (password protected)`
+  const role = isHost ? "Host Server" : "Connected Client";
+  vscode8.window.showInformationMessage(
+    `${running ? `Running (${role})` : "Stopped"} \u2014 ${urls.join("  ")}`
   );
 }
 function toggle(context) {
@@ -8327,7 +9209,7 @@ function toggle(context) {
 }
 async function relaunchWithRemoteDebug() {
   const port = cfg("remoteDebugPort", 9222);
-  const choice = await vscode5.window.showWarningMessage(
+  const choice = await vscode8.window.showWarningMessage(
     `This will reload the IDE window with --remote-debugging-port=${port} so the web UI and IDE chat panel stay in sync. Continue?`,
     { modal: true },
     "Relaunch"
@@ -8335,10 +9217,10 @@ async function relaunchWithRemoteDebug() {
   if (choice !== "Relaunch")
     return;
   try {
-    const argvPath = path6.join(os4.homedir(), ".antigravity-ide", "argv.json");
+    const argvPath = path7.join(os5.homedir(), ".antigravity-ide", "argv.json");
     let argv = {};
-    if (fs7.existsSync(argvPath)) {
-      const raw = fs7.readFileSync(argvPath, "utf8").replace(/^﻿/, "");
+    if (fs8.existsSync(argvPath)) {
+      const raw = fs8.readFileSync(argvPath, "utf8").replace(/^﻿/, "");
       const stripped = raw.replace(/^\s*\/\/.*$/gm, "");
       try {
         argv = JSON.parse(stripped);
@@ -8347,55 +9229,66 @@ async function relaunchWithRemoteDebug() {
       }
     }
     argv["remote-debugging-port"] = port;
-    fs7.writeFileSync(argvPath, JSON.stringify(argv, null, 2), "utf8");
+    fs8.writeFileSync(argvPath, JSON.stringify(argv, null, 2), "utf8");
     log(`[ext] wrote remote-debugging-port=${port} to ${argvPath}`);
   } catch (e) {
     log(`[ext] failed to update argv.json: ${e?.message ?? e}`);
-    vscode5.window.showErrorMessage(
+    vscode8.window.showErrorMessage(
       `Couldn't update argv.json automatically: ${e?.message ?? e}`
     );
     return;
   }
-  await vscode5.commands.executeCommand("workbench.action.reloadWindow");
+  await vscode8.commands.executeCommand("workbench.action.reloadWindow");
 }
 function updateStatusBar() {
   if (!statusBar)
     return;
-  const sync = running && chat?.cdpConnected() ? " $(link)" : "";
-  statusBar.text = running ? `$(radio-tower) Remote+${sync}` : "$(circle-slash) Remote+";
-  statusBar.tooltip = running ? `Antigravity Remote Plus: running${chat?.cdpConnected() ? ` (IDE\u21C4web synced on CDP port ${chat.cdpPort()})` : " (CDP not attached \u2014 command fallback)"}
-Click to stop.` : "Antigravity Remote Plus: stopped \u2014 click to start";
+  if (running) {
+    if (isHost) {
+      const sync = chat?.cdpConnected() ? " $(link)" : "";
+      statusBar.text = `$(radio-tower) Remote+ [Host: ${server?.activePort}]${sync}`;
+      statusBar.tooltip = `Antigravity Remote Plus: Host on port ${server?.activePort}
+Click to stop.`;
+    } else {
+      statusBar.text = `$(link) Remote+ [Connected]`;
+      statusBar.tooltip = `Antigravity Remote Plus: Connected to shared server
+Click to stop.`;
+    }
+  } else {
+    statusBar.text = "$(circle-slash) Remote+";
+    statusBar.tooltip = "Antigravity Remote Plus: stopped \u2014 click to start";
+  }
   statusBar.command = "antigravityRemotePlus.toggle";
   statusBar.show();
 }
 async function activate(context) {
-  output = vscode5.window.createOutputChannel("Antigravity Remote Plus");
+  output = vscode8.window.createOutputChannel("Antigravity Remote Plus");
   context.subscriptions.push(output);
-  statusBar = vscode5.window.createStatusBarItem(
-    vscode5.StatusBarAlignment.Right,
+  statusBar = vscode8.window.createStatusBarItem(
+    vscode8.StatusBarAlignment.Right,
     100
   );
   context.subscriptions.push(statusBar);
   updateStatusBar();
   context.subscriptions.push(
-    vscode5.commands.registerCommand(
+    vscode8.commands.registerCommand(
       "antigravityRemotePlus.start",
       () => startAll(context)
     ),
-    vscode5.commands.registerCommand("antigravityRemotePlus.stop", () => stopAll()),
-    vscode5.commands.registerCommand(
+    vscode8.commands.registerCommand("antigravityRemotePlus.stop", () => stopAll()),
+    vscode8.commands.registerCommand(
       "antigravityRemotePlus.toggle",
       () => toggle(context)
     ),
-    vscode5.commands.registerCommand("antigravityRemotePlus.openWeb", openWeb),
-    vscode5.commands.registerCommand("antigravityRemotePlus.showInfo", showInfo),
-    vscode5.commands.registerCommand(
+    vscode8.commands.registerCommand("antigravityRemotePlus.openWeb", openWeb),
+    vscode8.commands.registerCommand("antigravityRemotePlus.showInfo", showInfo),
+    vscode8.commands.registerCommand(
       "antigravityRemotePlus.relaunchWithRemoteDebug",
       relaunchWithRemoteDebug
     )
   );
   if (cfg("autoStart", true)) {
-    setTimeout(() => startAll(context).catch((e) => log(`[ext] autostart: ${e}`)), 2500);
+    setTimeout(() => startAll(context).catch((e) => log(`[ext] autostart: ${e}`)), 2e3);
   }
 }
 function deactivate() {

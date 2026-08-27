@@ -5,6 +5,7 @@ import {
   type ChatState,
   type Trajectory,
   type ModelInfo,
+  type IdeWindowInfo,
 } from "./api";
 import { useEvents, type ServerEvent } from "./useEvents";
 import { termBus } from "./termBus";
@@ -15,6 +16,7 @@ import { FilesPanel } from "./components/FilesPanel";
 import { GitPanel } from "./components/GitPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPanel } from "./components/TerminalPanel";
+import { WindowTabs } from "./components/WindowTabs";
 import { Icon, type IconName } from "./components/Icon";
 
 type Tab = "chat" | "files" | "git" | "terminal" | "settings";
@@ -30,7 +32,6 @@ const TABS: Array<{ id: Tab; label: string; icon: IconName }> = [
 // Workspace-scoped tabs share the workspace sidebar; Settings does not.
 const WS_TABS: Tab[] = ["chat", "files", "git", "terminal"];
 
-// Turn a workspace URI ("file:///Users/x/proj") into a filesystem path.
 function uriToPath(uri: string | null): string | null {
   if (!uri) return null;
   if (uri === "__none__") return null;
@@ -48,13 +49,30 @@ const EMPTY_STATE: ChatState = {
   messages: [],
 };
 
+function getInitialWindow(list: IdeWindowInfo[]): IdeWindowInfo {
+  const savedId = localStorage.getItem("arp_active_window_id");
+  const savedPath = localStorage.getItem("arp_active_window_path");
+  if (savedId) {
+    const byId = list.find((w) => w.id === savedId);
+    if (byId) return byId;
+  }
+  if (savedPath) {
+    const byPath = list.find((w) => w.workspacePath === savedPath);
+    if (byPath) return byPath;
+  }
+  return list.find((w) => w.isHost) || list[0];
+}
+
 export function App() {
   const [authed, setAuthed] = useState(false);
   const [checking, setChecking] = useState(true);
   const [tab, setTab] = useState<Tab>("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  // When a chat file-link is clicked, jump to the Files tab and open this path.
   const [openFilePath, setOpenFilePath] = useState<string | null>(null);
+
+  // Multi-window state
+  const [windows, setWindows] = useState<IdeWindowInfo[]>([]);
+  const [activeWindowId, setActiveWindowId] = useState<string | null>(null);
 
   const [state, setState] = useState<ChatState>(EMPTY_STATE);
   const [trajectories, setTrajectories] = useState<Trajectory[]>([]);
@@ -62,25 +80,39 @@ export function App() {
   const [wsFolders, setWsFolders] = useState<{ name: string; path: string }[]>([]);
   const [error, setError] = useState<string>("");
   const [stats, setStats] = useState<any>(null);
-  // Workspace-first: no conversation is shown until the user picks a workspace.
   const [activeWs, setActiveWs] = useState<string | null>(null);
-  // True right after "New chat" until the real trajectory appears — used to
-  // show a placeholder entry in the conversation list.
   const [pendingChat, setPendingChat] = useState(false);
-  // The workspace the IDE currently has open (file path), from the backend.
   const [currentWsPath, setCurrentWsPath] = useState<string | null>(null);
-  // When switching the IDE to another workspace, show a blocking popup until the
-  // IDE reloads and reconnects. Holds the target workspace name (null = hidden).
   const [switchingTo, setSwitchingTo] = useState<string | null>(null);
-  // Only auto-select the IDE's open workspace once (on first load).
   const autoSelectedWs = useRef(false);
 
-  // Probe auth on load without loading any conversation — the user must pick a
-  // workspace first (workspace-first UX).
+  // Probe auth on load
   useEffect(() => {
     (async () => {
       try {
-        await api.trajectories();
+        const winRes = await api.windows().catch(() => null);
+        if (winRes?.windows && winRes.windows.length > 0) {
+          setWindows(winRes.windows);
+          const initialWin = getInitialWindow(winRes.windows);
+          setActiveWindowId(initialWin.id);
+          api.setWindowId(initialWin.id);
+          if (initialWin.workspacePath) {
+            setActiveWs("file://" + initialWin.workspacePath);
+          }
+        }
+        const [tRes, sRes] = await Promise.all([
+          api.trajectories().catch(() => ({ list: [] })),
+          api.state().catch(() => EMPTY_STATE),
+        ]);
+        setTrajectories(tRes.list);
+        if (sRes && sRes.cascadeId && sRes.messages && sRes.messages.length > 0) {
+          setState(sRes);
+        } else if (tRes.list && tRes.list.length > 0) {
+          const topTraj = tRes.list[0];
+          api.state(topTraj.id).then((s) => {
+            if (s && s.cascadeId) setState(s);
+          }).catch(() => {});
+        }
         setAuthed(true);
       } catch (e) {
         if (e instanceof UnauthorizedError) setAuthed(false);
@@ -92,38 +124,94 @@ export function App() {
 
   const refreshAux = useCallback(async () => {
     try {
-      const [t, m, wf] = await Promise.all([
-        api.trajectories(),
-        api.models(),
-        api.workspaceFolders().catch(() => null),
+      const [winRes, t, m, wf, s, liveState] = await Promise.all([
+        api.windows().catch(() => null),
+        api.trajectories().catch(() => ({ list: [] })),
+        api.models().catch(() => ({ models: [] })),
+        api.workspaceFolders().catch(() => ({ folders: [] })),
+        api.stats().catch(() => null),
+        api.state().catch(() => null),
       ]);
-      setTrajectories(t.list ?? []);
-      setModels(m.models ?? []);
-      setWsFolders(wf?.folders ?? []);
-      setCurrentWsPath(wf?.current ?? null);
-      // On first load, auto-select the workspace the IDE currently has open so
-      // the user lands in the right project without a manual pick.
-      if (wf?.current && !autoSelectedWs.current) {
-        autoSelectedWs.current = true;
-        setActiveWs((cur) => cur ?? "file://" + wf.current);
+      if (winRes?.windows) {
+        setWindows(winRes.windows);
       }
-      // If we were waiting for the IDE to switch workspaces and it now reports
-      // the target (or simply reconnected with a workspace), close the popup.
-      if (wf?.current) {
-        setSwitchingTo((cur) => (cur ? null : cur));
+      setTrajectories(t.list);
+      setModels(m.models);
+      setWsFolders(wf.folders);
+      if (s) setStats(s);
+      if (liveState && liveState.cascadeId && liveState.messages && liveState.messages.length > 0) {
+        setState((prev) => (!prev.cascadeId ? liveState : prev));
       }
-    } catch (e) {
-      if (e instanceof UnauthorizedError) setAuthed(false);
+    } catch {
+      /* non-fatal */
     }
   }, []);
+
+  // Fetch current workspace path from IDE to auto-select sidebar workspace
+  useEffect(() => {
+    let mounted = true;
+    api
+      .workspace()
+      .then((res) => {
+        if (!mounted || !res) return;
+        const curPath = (res as any).path || res.current;
+        if (curPath) setCurrentWsPath(curPath);
+        if (switchingTo && curPath && curPath.endsWith(switchingTo)) {
+          setSwitchingTo(null);
+        }
+        if (!autoSelectedWs.current && curPath) {
+          autoSelectedWs.current = true;
+          setActiveWs("file://" + curPath);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [activeWindowId]);
 
   useEffect(() => {
     if (authed) refreshAux();
   }, [authed, refreshAux]);
 
-  // While switching the IDE to another workspace, the window reloads and drops
-  // the SSE stream — poll workspaceFolders until it comes back, then close the
-  // popup (refreshAux clears `switchingTo` once a workspace is reported).
+  // Switch active IDE window
+  const handleSelectWindow = async (windowId: string) => {
+    setActiveWindowId(windowId);
+    api.setWindowId(windowId);
+    localStorage.setItem("arp_active_window_id", windowId);
+    
+    // Find window to update workspace selection
+    const targetWin = windows.find((w) => w.id === windowId);
+    if (targetWin?.workspacePath) {
+      localStorage.setItem("arp_active_window_path", targetWin.workspacePath);
+      setActiveWs("file://" + targetWin.workspacePath);
+    }
+
+    // Immediately fetch active chat for this newly selected window
+    try {
+      const [sRes, tRes] = await Promise.all([
+        api.state().catch(() => EMPTY_STATE),
+        api.trajectories().catch(() => ({ list: [] })),
+      ]);
+      setTrajectories(tRes.list);
+      if (sRes && sRes.cascadeId && sRes.messages && sRes.messages.length > 0) {
+        setState(sRes);
+      } else if (tRes.list && tRes.list.length > 0) {
+        const topTraj = tRes.list[0];
+        const s = await api.state(topTraj.id).catch(() => EMPTY_STATE);
+        setState(s);
+      } else {
+        setState(EMPTY_STATE);
+      }
+    } catch {
+      setState(EMPTY_STATE);
+    }
+
+    setTimeout(() => {
+      refreshAux().catch(() => {});
+    }, 50);
+  };
+
   useEffect(() => {
     if (!switchingTo) return;
     const iv = setInterval(() => {
@@ -132,39 +220,91 @@ export function App() {
     return () => clearInterval(iv);
   }, [switchingTo, refreshAux]);
 
-  const onEvent = useCallback((e: ServerEvent) => {
-    if (e.type === "state") {
-      setState(e.state);
-      // Once a real cascade id shows up, the pending placeholder is no longer
-      // needed (the trajectory now exists and will appear in the list).
-      if (e.state.cascadeId) setPendingChat(false);
-    } else if (e.type === "state_update") {
-      setState((prev) => {
-        if (!prev || prev.cascadeId !== e.cascadeId || prev.messages.length === 0) return prev;
-        const newMsgs = [...prev.messages];
-        newMsgs[newMsgs.length - 1] = e.lastMessage;
-        return { ...prev, messages: newMsgs, generating: e.generating, statusText: e.statusText };
-      });
-    } else if (e.type === "status") {
-      setState((prev) => ({
-        ...prev,
-        cascadeId: e.cascadeId,
-        generating: e.generating,
-        statusText: e.statusText,
-      }));
-    } else if (e.type === "trajectories") {
-      setTrajectories(e.list);
-    } else if (
-      e.type === "term-data" ||
-      e.type === "term-exit" ||
-      e.type === "term-list"
-    ) {
-      // Terminal frames are forwarded to the TerminalPanel via a small bus.
-      termBus.emit(e);
-    } else if (e.type === "stats_update" && (e as any).stats) {
-      setStats((e as any).stats);
-    }
-  }, []);
+  const onEvent = useCallback(
+    (e: ServerEvent) => {
+      if (e.type === "windows") {
+        setWindows(e.windows);
+        if (
+          (!activeWindowId || !e.windows.some((w) => w.id === activeWindowId)) &&
+          e.windows.length > 0
+        ) {
+          const nextWin = getInitialWindow(e.windows);
+          setActiveWindowId(nextWin.id);
+          api.setWindowId(nextWin.id);
+          if (nextWin.workspacePath) {
+            setActiveWs("file://" + nextWin.workspacePath);
+          }
+        }
+        return;
+      }
+
+      // Update generating state in windows array if windowId provided
+      if (e.windowId) {
+        setWindows((prev) =>
+          prev.map((win) => {
+            if (win.id !== e.windowId) return win;
+            if (e.type === "state") {
+              return {
+                ...win,
+                isGenerating: !!e.state.generating,
+                statusText: e.state.statusText || "Idle",
+                activeCascadeId: e.state.cascadeId,
+              };
+            }
+            if (e.type === "state_update" || e.type === "status") {
+              return {
+                ...win,
+                isGenerating: !!e.generating,
+                statusText: e.statusText || "Idle",
+                activeCascadeId: e.cascadeId,
+              };
+            }
+            return win;
+          })
+        );
+      }
+
+      // If event belongs to another window, don't overwrite current view
+      if (e.windowId && activeWindowId && e.windowId !== activeWindowId) {
+        return;
+      }
+
+      if (e.type === "state") {
+        setState(e.state);
+        if (e.state.cascadeId) setPendingChat(false);
+      } else if (e.type === "state_update") {
+        setState((prev) => {
+          if (!prev || prev.cascadeId !== e.cascadeId || prev.messages.length === 0) return prev;
+          const newMsgs = [...prev.messages];
+          newMsgs[newMsgs.length - 1] = e.lastMessage;
+          return { ...prev, messages: newMsgs, generating: e.generating, statusText: e.statusText };
+        });
+      } else if (e.type === "status") {
+        setState((prev) => ({
+          ...prev,
+          cascadeId: e.cascadeId,
+          generating: e.generating,
+          statusText: e.statusText,
+        }));
+        if (!e.generating) {
+          api.models().then((r) => setModels(r.models)).catch(() => {});
+        }
+      } else if (e.type === "models") {
+        setModels(e.models);
+      } else if (e.type === "trajectories") {
+        setTrajectories(e.list);
+      } else if (
+        e.type === "term-data" ||
+        e.type === "term-exit" ||
+        e.type === "term-list"
+      ) {
+        termBus.emit(e);
+      } else if (e.type === "stats_update" && (e as any).stats) {
+        setStats((e as any).stats);
+      }
+    },
+    [activeWindowId]
+  );
 
   useEvents(onEvent, authed);
 
@@ -172,6 +312,16 @@ export function App() {
     const ok = await api.login(password);
     if (ok) {
       setAuthed(true);
+      const winRes = await api.windows().catch(() => null);
+      if (winRes?.windows && winRes.windows.length > 0) {
+        setWindows(winRes.windows);
+        const initialWin = getInitialWindow(winRes.windows);
+        setActiveWindowId(initialWin.id);
+        api.setWindowId(initialWin.id);
+        if (initialWin.workspacePath) {
+          setActiveWs("file://" + initialWin.workspacePath);
+        }
+      }
       const s = await api.state();
       setState(s);
     }
@@ -188,17 +338,12 @@ export function App() {
   };
 
   const newChat = async () => {
-    // Jump to an empty chat view immediately and show a placeholder in the list
-    // (Antigravity doesn't create the trajectory until the first message is
-    // sent, so we display a pending entry until it appears).
     setTab("chat");
-    // If the selected workspace isn't the one the IDE has open, switch first
-    // (reloads the window) — show the blocking popup until it reconnects.
     const targetPath = uriToPath(activeWs);
     if (targetPath && currentWsPath && targetPath !== currentWsPath) {
       setSwitchingTo(targetPath.split("/").pop() || targetPath);
       await api.openWorkspace(targetPath);
-      return; // window reloads; refreshAux closes the popup on reconnect
+      return;
     }
     setState(EMPTY_STATE);
     setPendingChat(true);
@@ -207,23 +352,18 @@ export function App() {
   };
 
   const switchCascade = async (id: string, wsUri?: string, wsName?: string) => {
-    // Clicking a conversation always jumps to the chat view.
     setTab("chat");
-    // If the conversation belongs to a workspace the IDE doesn't currently have
-    // open, switch the IDE to it first — this reloads the window, so we show a
-    // blocking loading popup that auto-closes when the IDE reconnects.
     const targetPath = uriToPath(wsUri ?? null);
     if (targetPath && currentWsPath && targetPath !== currentWsPath) {
       setSwitchingTo(wsName || targetPath.split("/").pop() || targetPath);
       await api.openWorkspace(targetPath);
-      return; // window reloads; refreshAux will close the popup on reconnect
+      return;
     }
     const s = await api.state(id);
     setState(s);
     await api.switchCascade(id);
   };
 
-  // Selecting a workspace loads its conversations; deselecting clears the view.
   const selectWorkspace = (uri: string | null) => {
     setActiveWs(uri);
     setState(EMPTY_STATE);
@@ -241,8 +381,6 @@ export function App() {
     }
   };
 
-  // Open a file (from a chat file-link or plan reference) in the Files tab.
-  // We pass the absolute path down; FilesPanel resolves + loads it.
   const openFileInFiles = (path: string) => {
     setOpenFilePath(path);
     setTab("files");
@@ -258,12 +396,11 @@ export function App() {
   const wsTab = WS_TABS.includes(tab);
   const cwd = uriToPath(activeWs);
 
-  // Prompt shown by workspace-scoped tabs when no workspace is picked yet.
   const pickPrompt = (
     <div className="chat">
       <div className="empty-chat">
         <Icon name="folder" size={40} className="empty-icon" />
-        <p>Chọn một workspace ở menu bên trái để bắt đầu.</p>
+        <p>Chọn một workspace ở menu bên trái hoặc chuyển đổi cửa sổ IDE ở thanh trên.</p>
         <button
           className="ghost icon-btn menu-open-btn"
           onClick={() => setSidebarOpen(true)}
@@ -274,7 +411,6 @@ export function App() {
     </div>
   );
 
-  // The content of the currently-active workspace-scoped tab.
   const renderWsContent = () => {
     if (!activeWs) return pickPrompt;
     return (
@@ -326,18 +462,30 @@ export function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <button
-          className="ghost icon-btn menu-btn"
-          aria-label="Workspaces"
-          onClick={() => setSidebarOpen((v) => !v)}
-          disabled={!wsTab}
-        >
-          <Icon name="menu" size={18} />
-        </button>
-        <div className="brand">
-          <Icon name="bot" size={18} className="brand-icon" />
-          <span className="brand-text">Remote Plus</span>
+        <div className="topbar-left">
+          <button
+            className="ghost icon-btn menu-btn"
+            aria-label="Workspaces"
+            onClick={() => setSidebarOpen((v) => !v)}
+            disabled={!wsTab}
+          >
+            <Icon name="menu" size={18} />
+          </button>
+          <div className="brand">
+            <Icon name="bot" size={18} className="brand-icon" />
+            <span className="brand-text">Remote Plus</span>
+          </div>
         </div>
+
+        {windows.length > 0 && (
+          <WindowTabs
+            windows={windows}
+            activeWindowId={activeWindowId}
+            onSelectWindow={handleSelectWindow}
+            onRefresh={refreshAux}
+          />
+        )}
+
         <nav className="tabs">
           {TABS.map((t) => (
             <button
@@ -367,10 +515,13 @@ export function App() {
             <Sidebar
               trajectories={trajectories}
               wsFolders={wsFolders}
+              windows={windows}
+              activeWindowId={activeWindowId}
               activeId={state.cascadeId}
               activeWs={activeWs}
               pendingChat={pendingChat}
               onSelectWs={(ws) => selectWorkspace(ws)}
+              onSelectWindow={handleSelectWindow}
               onSwitch={(id, wsUri, wsName) => {
                 switchCascade(id, wsUri, wsName);
                 setSidebarOpen(false);

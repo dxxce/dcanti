@@ -1,19 +1,35 @@
-// Subscribe to the server's SSE stream (/api/events) and surface chat events.
+// Subscribe to the server's SSE stream (/api/events) and surface chat/terminal/window events.
 // EventSource can't set Authorization headers, so auth rides on the cookie set
 // at login. We reconnect automatically on drop.
 
 import { useEffect, useRef } from "react";
-import type { ChatState, Trajectory, TerminalInfo } from "./api";
+import type { ChatState, Trajectory, TerminalInfo, IdeWindowInfo, ModelInfo } from "./api";
 
 export type ServerEvent =
-  | { type: "state"; state: ChatState }
-  | { type: "state_update"; cascadeId: string; generating: boolean; statusText: string; lastMessage: any }
-  | { type: "status"; cascadeId: string; generating: boolean; statusText: string }
-  | { type: "stats_update"; stats: any }
-  | { type: "trajectories"; list: Trajectory[] }
-  | { type: "term-data"; id: string; data: string }
-  | { type: "term-exit"; id: string; code: number | null }
-  | { type: "term-list"; terminals: TerminalInfo[] };
+  | { type: "windows"; windows: IdeWindowInfo[] }
+  | { type: "state"; windowId?: string; state: ChatState }
+  | {
+      type: "state_update";
+      windowId?: string;
+      cascadeId: string;
+      generating: boolean;
+      statusText: string;
+      lastMessage: any;
+    }
+  | {
+      type: "status";
+      windowId?: string;
+      cascadeId: string;
+      generating: boolean;
+      statusText: string;
+    }
+  | { type: "models"; windowId?: string; models: ModelInfo[] }
+  | { type: "quota"; windowId?: string; quota: any }
+  | { type: "stats_update"; windowId?: string; stats: any }
+  | { type: "trajectories"; windowId?: string; list: Trajectory[] }
+  | { type: "term-data"; windowId?: string; id: string; data: string }
+  | { type: "term-exit"; windowId?: string; id: string; code: number | null }
+  | { type: "term-list"; windowId?: string; terminals: TerminalInfo[] };
 
 export function useEvents(onEvent: (e: ServerEvent) => void, enabled: boolean) {
   const cbRef = useRef(onEvent);

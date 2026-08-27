@@ -13,6 +13,9 @@
 
 import * as http from "http";
 import * as https from "https";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 
@@ -326,69 +329,196 @@ export class LsClient {
   }
 
   async getAllTrajectories(): Promise<Trajectory[]> {
-    const body = await this.call("GetAllCascadeTrajectories", {});
-    if (!body) return [];
-    let parsed: any;
+    const listMap = new Map<string, Trajectory>();
+
+    // 1. Query LS ConnectRPC
     try {
-      parsed = JSON.parse(body);
-    } catch {
-      return [];
-    }
-    // Real Antigravity shape: { trajectorySummaries: { <cascadeId>: {...} } }.
-    // The MAP KEY is the cascadeId used to query GetCascadeTrajectory — NOT the
-    // inner trajectoryId (that one returns "trajectory not found").
-    const summaries = parsed?.trajectorySummaries;
-    let list: Trajectory[] = [];
-    if (summaries && typeof summaries === "object" && !Array.isArray(summaries)) {
-      list = Object.entries(summaries).map(([cascadeId, s]: [string, any]) => {
-        // Each summary carries workspaces[].workspaceFolderAbsoluteUri — use the
-        // first as the grouping key so the UI can nest conversations per project.
-        const wsUri = String(
-          s?.workspaces?.[0]?.workspaceFolderAbsoluteUri ??
-            s?.trajectoryMetadata?.workspaces?.[0]?.workspaceFolderAbsoluteUri ??
-            ""
-        );
-        return {
-          id: cascadeId,
-          title: s?.summary ?? s?.title ?? s?.name ?? undefined,
-          status: s?.status ?? undefined,
-          updatedAt:
-            s?.lastModifiedTime ??
-            s?.lastUserInputTime ??
-            s?.createdTime ??
-            undefined,
-          workspaceUri: wsUri || undefined,
-          workspaceName: wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : undefined,
-          raw: s,
-        };
-      });
-    } else {
-      // Fallback for older/alternate shapes.
-      const rawArray =
-        parsed?.trajectories ?? parsed?.cascade_trajectories ?? parsed?.cascades ?? [];
-      if (Array.isArray(rawArray)) {
-        list = rawArray.map((t: any): Trajectory => ({
-          id: String(t.cascadeId ?? t.cascade_id ?? t.id ?? t.trajectoryId ?? t._id ?? ""),
-          title: t.title ?? t.name ?? t.summary ?? undefined,
-          status: t.status ?? t.state ?? undefined,
-          updatedAt: t.updatedAt ?? t.updated_at ?? t.lastModified ?? undefined,
-          raw: t,
-        }));
+      const body = await this.call("GetAllCascadeTrajectories", {});
+      if (body) {
+        const parsed = JSON.parse(body);
+        const summaries = parsed?.trajectorySummaries;
+        if (summaries && typeof summaries === "object" && !Array.isArray(summaries)) {
+          for (const [cascadeId, s] of Object.entries<any>(summaries)) {
+            const wsUri = String(
+              s?.workspaces?.[0]?.workspaceFolderAbsoluteUri ??
+                s?.trajectoryMetadata?.workspaces?.[0]?.workspaceFolderAbsoluteUri ??
+                s?.trajectoryMetadata?.workspaceUris?.[0] ??
+                ""
+            );
+            listMap.set(cascadeId, {
+              id: cascadeId,
+              title: s?.summary ?? s?.title ?? s?.name ?? undefined,
+              status: s?.status ?? undefined,
+              updatedAt:
+                s?.lastModifiedTime ??
+                s?.lastUserInputTime ??
+                s?.createdTime ??
+                undefined,
+              workspaceUri: wsUri || undefined,
+              workspaceName: wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : undefined,
+              raw: s,
+            });
+          }
+        }
       }
+    } catch (e: any) {
+      this.log(`[LS] GetAllCascadeTrajectories RPC error: ${e?.message ?? e}`);
     }
-    // Newest first by updatedAt (ISO strings sort lexicographically).
+
+    // 2. Supplement with all historical trajectories from ~/.gemini/antigravity-ide/brain/
+    try {
+      const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
+      if (fs.existsSync(brainDir)) {
+        const entries = fs.readdirSync(brainDir);
+        for (const id of entries) {
+          if (id.startsWith(".") || id === "tempmediaStorage") continue;
+          if (listMap.has(id)) continue; // Keep live RPC data if already present
+          const transcriptPath = path.join(brainDir, id, ".system_generated", "logs", "transcript.jsonl");
+          if (!fs.existsSync(transcriptPath)) continue;
+
+          try {
+            const stat = fs.statSync(transcriptPath);
+            const fd = fs.openSync(transcriptPath, "r");
+            const buf = Buffer.alloc(12288);
+            const bytesRead = fs.readSync(fd, buf, 0, 12288, 0);
+            fs.closeSync(fd);
+            const text = buf.toString("utf8", 0, bytesRead);
+            const lines = text.split("\n");
+
+            let wsUri = "";
+            let title = "";
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const step = JSON.parse(line);
+                const content = String(step.content || "");
+                if (!wsUri) {
+                  const mUser = content.match(/<user_information>[\s\S]*?([\/][^\s\n\r\-]+)\s*->/);
+                  const mDoc = content.match(/Active Document:\s*([\/][^\n\r]+)/);
+                  if (mUser) {
+                    wsUri = "file://" + mUser[1].trim();
+                  } else if (mDoc) {
+                    const fullDoc = mDoc[1].trim().split(" ")[0];
+                    const parts = fullDoc.split("/");
+                    if (parts.length >= 4) {
+                      wsUri = "file://" + parts.slice(0, 4).join("/");
+                    }
+                  }
+                }
+                if (!title && step.type === "CONVERSATION_HISTORY") {
+                  const tm = content.match(/## Conversation [^:]+:\s*([^\n\r]+)/);
+                  if (tm) title = tm[1].trim();
+                }
+                if (!title && step.type === "USER_INPUT") {
+                  const req = content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+                  if (req) {
+                    title = req[1].split("\n")[0].slice(0, 65).trim();
+                  }
+                }
+              } catch {}
+            }
+
+            const wsName = wsUri ? decodeURIComponent(wsUri.split("/").pop() || wsUri) : undefined;
+            listMap.set(id, {
+              id,
+              title: title || `Conversation ${id.slice(0, 8)}`,
+              status: "CASCADE_RUN_STATUS_IDLE",
+              updatedAt: stat.mtime.toISOString(),
+              workspaceUri: wsUri || undefined,
+              workspaceName: wsName || undefined,
+            });
+          } catch {}
+        }
+      }
+    } catch (e: any) {
+      this.log(`[LS] brain disk scan warning: ${e?.message ?? e}`);
+    }
+
+    const list = Array.from(listMap.values());
     list.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
     return list;
   }
 
   async getTrajectory(cascadeId: string): Promise<any | null> {
-    const body = await this.call("GetCascadeTrajectory", { cascadeId });
-    if (!body) return null;
+    // Try LS RPC first
     try {
-      return JSON.parse(body);
-    } catch {
-      return null;
-    }
+      const body = await this.call("GetCascadeTrajectory", { cascadeId });
+      if (body) {
+        const parsed = JSON.parse(body);
+        if (parsed?.trajectory?.steps && parsed.trajectory.steps.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+
+    // Fallback: Read transcript from disk
+    try {
+      const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
+      const transcriptPath = path.join(brainDir, cascadeId, ".system_generated", "logs", "transcript.jsonl");
+      if (fs.existsSync(transcriptPath)) {
+        const raw = fs.readFileSync(transcriptPath, "utf8");
+        const lines = raw.split("\n");
+        const steps: any[] = [];
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed.type === "USER_INPUT") {
+              let userText = parsed.content || "";
+              const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+              if (req) userText = req[1];
+              steps.push({
+                type: "CORTEX_STEP_TYPE_USER_INPUT",
+                status: "CORTEX_STEP_STATUS_DONE",
+                userInput: { userResponse: userText },
+                metadata: {
+                  sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? steps.length },
+                  createdAt: parsed.created_at,
+                },
+              });
+            } else if (parsed.type === "PLANNER_RESPONSE") {
+              steps.push({
+                type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                status: "CORTEX_STEP_STATUS_DONE",
+                plannerResponse: {
+                  response: parsed.content || "",
+                  toolCalls: parsed.tool_calls,
+                },
+                metadata: {
+                  createdAt: parsed.created_at,
+                },
+              });
+            } else if (parsed.type === "TOOL_CALL" || parsed.tool_calls) {
+              const tc = parsed.tool_calls?.[0];
+              steps.push({
+                type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
+                status: "CORTEX_STEP_STATUS_DONE",
+                content: parsed.content,
+                metadata: {
+                  toolAction: tc?.name,
+                  toolSummary: tc?.toolSummary,
+                  toolCall: { argumentsJson: JSON.stringify(tc?.parameters || {}) },
+                  createdAt: parsed.created_at,
+                },
+              });
+            }
+          } catch {}
+        }
+
+        if (steps.length > 0) {
+          return {
+            trajectory: {
+              trajectoryId: cascadeId,
+              steps,
+            },
+          };
+        }
+      }
+    } catch {}
+
+    return null;
   }
 
   async cancel(cascadeId: string): Promise<boolean> {

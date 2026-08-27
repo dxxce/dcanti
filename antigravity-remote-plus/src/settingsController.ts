@@ -194,33 +194,52 @@ export const SettingsController = {
             headers: { Authorization: `Bearer ${serverInfo.auth_token}` },
           });
           ws.on("open", () => {
-            const payload = { account_id: match.id, email: match.email, id: match.id };
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", data: payload }));
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ action: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ command: "tools.ws.request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "ws_request_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "ws_request_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "ws_switch_account", payload }));
-            ws.send(JSON.stringify({ type: "ws_switch_account", account_id: match.id, email: match.email }));
-            ws.send(JSON.stringify({ type: "tools.account.switch", payload }));
-            ws.send(JSON.stringify({ type: "switch_account", email, account_id: match.id }));
+            const reqId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            // Exact Cockpit Tools protocol format
+            ws.send(JSON.stringify({
+              type: "request.switch_account",
+              payload: { account_id: match.id, request_id: reqId },
+            }));
+            // Legacy / alternate variants
+            ws.send(JSON.stringify({ type: "tools.ws.request_switch_account", payload: { account_id: match.id, email: match.email } }));
+            ws.send(JSON.stringify({ type: "switch_account", account_id: match.id, email: match.email }));
             setTimeout(() => { try { ws.close(); } catch {} }, 600);
           });
           ws.on("error", () => {});
         }
       } catch {}
 
-      // 3.2 Trigger Cockpit Tools URL Scheme & activate macOS app
+      // 3.2 Direct macOS Keychain Injection (Antigravity 2.0 native credential)
+      if (process.platform === "darwin" && match.token?.access_token) {
+        try {
+          const { execSync } = require("child_process");
+          const expiryDate = match.token.expiry_timestamp
+            ? new Date(match.token.expiry_timestamp * 1000).toISOString()
+            : new Date(Date.now() + 3600 * 1000).toISOString();
+          const credObj = {
+            token: {
+              access_token: match.token.access_token,
+              token_type: match.token.token_type || "Bearer",
+              refresh_token: match.token.refresh_token || "",
+              expiry: expiryDate,
+            },
+            auth_method: "consumer",
+          };
+          const b64 = Buffer.from(JSON.stringify(credObj)).toString("base64");
+          const keychainVal = `go-keyring-base64:${b64}`;
+          try { execSync(`security delete-generic-password -s gemini -a antigravity 2>/dev/null || true`); } catch {}
+          execSync(`security add-generic-password -s gemini -a antigravity -w "${keychainVal}" -A`);
+        } catch {}
+      }
+
+      // 3.3 Trigger Cockpit Tools URL Scheme & activate macOS app
       try {
         const { exec } = require("child_process");
         exec(`open "cockpit-tools://switch?account_id=${match.id}&email=${encodeURIComponent(email)}"`);
         exec(`open "cockpit-tools://switch-account?id=${match.id}&email=${encodeURIComponent(email)}"`);
-        exec(`osascript -e 'tell application "Cockpit Tools" to activate'`);
       } catch {}
 
-      // 3.5 Reset SQLite global state OAuth cache so IDE binds immediately to new account
+      // 3.4 Reset SQLite global state OAuth cache so IDE binds immediately to new account
       try {
         const { execSync } = require("child_process");
         const dbPath = path.join(os.homedir(), "Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb");

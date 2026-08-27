@@ -1,4 +1,4 @@
-// Local HTTP server: serves the built web UI and exposes a REST + SSE API.
+// Local HTTP server: serves the built web UI and exposes a REST + SSE API + WebSocket RPC hub.
 // Auth is a single shared password (config) checked via a signed cookie token
 // or an Authorization: Bearer header. Binds to 127.0.0.1 by default; when
 // bound to 0.0.0.0 the password is mandatory.
@@ -8,11 +8,14 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { URL } from "url";
+import * as vscode from "vscode";
 import { ChatController } from "./chatController";
 import { FileController } from "./fileController";
 import { GitController } from "./gitController";
 import { SettingsController, RemoteSettings } from "./settingsController";
 import { TerminalController } from "./terminalController";
+import { WindowManager } from "./windowManager";
+import { IdeWindowInfo } from "./windowTypes";
 
 export interface ServerOptions {
   port: number;
@@ -48,15 +51,25 @@ export class RemoteServer {
   private chat: ChatController;
   private server: http.Server | null = null;
   private sseClients = new Set<http.ServerResponse>();
-  private unsub: (() => void) | null = null;
   private boundPort = 0;
   private terminals: TerminalController;
+  public windowManager: WindowManager;
 
-  constructor(opts: ServerOptions, chat: ChatController) {
+  constructor(opts: ServerOptions, chat: ChatController, localWindowInfo: IdeWindowInfo) {
     this.opts = opts;
     this.chat = chat;
     // Terminal output/lifecycle events ride the same SSE channel as chat events.
-    this.terminals = new TerminalController(opts.log, (e) => this.broadcast(e));
+    this.terminals = new TerminalController(opts.log, (e) =>
+      this.broadcast({ ...e, windowId: localWindowInfo.id })
+    );
+
+    this.windowManager = new WindowManager(
+      localWindowInfo,
+      chat,
+      this.terminals,
+      opts.log,
+      (e) => this.broadcast(e)
+    );
   }
 
   /** The port the server actually bound to (may differ from opts.port if it
@@ -68,31 +81,35 @@ export class RemoteServer {
   // Token is derived deterministically from the password so it stays valid
   // across server restarts / IDE reloads — otherwise a random per-boot secret
   // would log the user out on every reload.
-  private token(): string {
+  public token(): string {
     return crypto
       .createHmac("sha256", "antigravity-remote-plus/v1")
       .update(this.opts.password)
       .digest("hex");
   }
 
-  private isAuthed(req: http.IncomingMessage): boolean {
+  public isAuthed(req: http.IncomingMessage): boolean {
     if (!this.opts.password) return true; // no password set
     const auth = req.headers["authorization"];
     if (auth && auth === `Bearer ${this.token()}`) return true;
     const cookie = req.headers["cookie"] ?? "";
     const m = /(?:^|;\s*)arp_token=([^;]+)/.exec(cookie);
     if (m && m[1] === this.token()) return true;
+
+    // Check query token for WebSocket / EventSource upgrade
+    try {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+      const queryToken = url.searchParams.get("token");
+      if (queryToken && queryToken === this.token()) return true;
+    } catch {}
+
     return false;
   }
 
   start(): Promise<void> {
-    // Bind to the fixed configured port so the web URL never changes.
-    // EADDRINUSE right after a window reload is usually a stale socket from the
-    // previous instance that hasn't been released yet, so we retry the SAME
-    // port a few times with a short delay before giving up.
     const port = this.opts.port;
-    const maxAttempts = 10;
-    const retryDelayMs = 400;
+    const maxAttempts = 5;
+    const retryDelayMs = 300;
 
     const attempt = (n: number): Promise<void> =>
       new Promise((resolve, reject) => {
@@ -117,8 +134,7 @@ export class RemoteServer {
           } else if (err.code === "EADDRINUSE") {
             reject(
               new Error(
-                `port ${port} is still in use after ${maxAttempts} attempts. ` +
-                  `Run "Antigravity Remote Plus: Stop" (or reload the window) to release it.`
+                `port ${port} is still in use after ${maxAttempts} attempts.`
               )
             );
           } else {
@@ -131,12 +147,13 @@ export class RemoteServer {
           server.removeListener("error", onError);
           this.server = server;
           this.boundPort = port;
+          // Attach WebSocket RPC server for Secondary IDE windows
+          this.windowManager.attachWebSocketServer(server, (req) => this.isAuthed(req));
+
           // Keep the server alive on later runtime errors instead of crashing.
           server.on("error", (e) =>
             this.opts.log(`[server] runtime error: ${(e as Error).message}`)
           );
-          // Forward chat events to all SSE clients.
-          this.unsub = this.chat.onEvent((e) => this.broadcast(e));
           this.opts.log(`[server] listening on http://${this.opts.host}:${port}`);
           resolve();
         });
@@ -146,7 +163,7 @@ export class RemoteServer {
   }
 
   stop() {
-    this.unsub?.();
+    this.windowManager.stop();
     for (const c of this.sseClients) {
       try {
         c.end();
@@ -248,8 +265,19 @@ export class RemoteServer {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+    const host = req.headers.host || "127.0.0.1";
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", `http://${host}`);
+    } catch {
+      url = new URL("/", "http://127.0.0.1");
+    }
     const pathName = url.pathname;
+
+    // --- Public: Health check probe ---
+    if (pathName === "/api/health") {
+      return this.json(res, 200, { ok: true, activePort: this.activePort });
+    }
 
     // --- Public: login endpoint ---
     if (pathName === "/api/login" && req.method === "POST") {
@@ -264,6 +292,24 @@ export class RemoteServer {
         this.json(res, 401, { error: "wrong password" });
       }
       return;
+    }
+
+    // --- Localhost / Authed: Reload Window endpoint ---
+    if (pathName === "/api/reload-window" && req.method === "POST") {
+      const addr = req.socket.remoteAddress || "";
+      const isLocal = addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || this.isAuthed(req);
+      if (!isLocal) {
+        return this.json(res, 401, { error: "unauthorized" });
+      }
+      try {
+        if (typeof this.windowManager.broadcastRpc === "function") {
+          this.windowManager.broadcastRpc("reload-window", {});
+        }
+      } catch {}
+      setTimeout(() => {
+        vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }, 150);
+      return this.json(res, 200, { ok: true });
     }
 
     // --- API auth gate ---
@@ -287,7 +333,7 @@ export class RemoteServer {
   ) {
     const route = pathName.replace(/^\/api\//, "");
 
-    // SSE stream of chat events.
+    // SSE stream of chat/terminal/window events.
     if (route === "events") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -297,257 +343,249 @@ export class RemoteServer {
       res.write(`retry: 2000\n\n`);
       this.sseClients.add(res);
       req.on("close", () => this.sseClients.delete(res));
-      // Push initial state.
+
+      // Push initial windows list
+      res.write(
+        `data: ${JSON.stringify({
+          type: "windows",
+          windows: this.windowManager.listWindows(),
+        })}\n\n`
+      );
+
+      // Push initial state for local window
       this.chat.buildState().then((state) => {
-        res.write(`data: ${JSON.stringify({ type: "state", state })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            type: "state",
+            windowId: this.windowManager.getLocalWindowId(),
+            state,
+          })}\n\n`
+        );
       });
       return;
     }
 
+    // --- Windows list endpoint ---
+    if (route === "windows") {
+      return this.json(res, 200, { windows: this.windowManager.listWindows() });
+    }
+
+    // --- Reload Window endpoint ---
+    if (route === "reload-window" && req.method === "POST") {
+      this.windowManager.broadcastRpc("reload-window", {});
+      setTimeout(() => {
+        vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }, 150);
+      return this.json(res, 200, { ok: true });
+    }
+
+    // Resolve target windowId
+    let windowId =
+      url.searchParams.get("windowId") ||
+      (req.headers["x-window-id"] as string) ||
+      undefined;
+
+    // Helper for executing RPC actions on the target window
+    const rpc = async (action: string, payload?: any) => {
+      try {
+        const result = await this.windowManager.executeRpc(windowId, action, payload);
+        return this.json(res, 200, result);
+      } catch (e: any) {
+        return this.json(res, 500, { ok: false, error: e?.message ?? e });
+      }
+    };
+
     switch (route) {
       case "state": {
-        const id = url.searchParams.get("cascadeId") ?? undefined;
-        return this.json(res, 200, await this.chat.buildState(id));
+        const cascadeId = url.searchParams.get("cascadeId") ?? undefined;
+        return rpc("state", { cascadeId });
       }
       case "trajectories":
-        return this.json(res, 200, { list: await this.chat.getTrajectories() });
+        return rpc("trajectories");
       case "quota":
-        return this.json(res, 200, (await this.chat.getQuota()) ?? {});
+        return rpc("quota");
       case "models":
-        return this.json(res, 200, { models: await this.chat.getModels() });
-      case "screenshot": {
-        const b64 = await this.chat.captureScreenshot();
-        if (!b64) return this.json(res, 200, { ok: false });
-        return this.json(res, 200, { ok: true, dataUri: `data:image/png;base64,${b64}` });
-      }
+        return rpc("models");
+      case "screenshot":
+        return rpc("screenshot");
       case "new-chat":
-        await this.chat.newChat();
-        return this.json(res, 200, { ok: true });
+        return rpc("new-chat");
       case "send": {
         const body = await this.readJson(req);
-        const text = String(body.text || "");
-        const images = Array.isArray(body.images) ? body.images : undefined;
-        await this.chat.sendMessage(text, images);
-        return this.json(res, 200, { ok: true });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("send", {
+          text: String(body.text || ""),
+          images: Array.isArray(body.images) ? body.images : undefined,
+        });
       }
       case "slash-command": {
         const body = await this.readJson(req);
-        await this.chat.sendSlashCommand(
-          String(body.name ?? ""),
-          String(body.modelFacingText ?? ""),
-          String(body.text ?? "")
-        );
-        return this.json(res, 200, { ok: true });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("slash-command", {
+          name: body.name,
+          modelFacingText: body.modelFacingText,
+          text: body.text,
+        });
       }
       case "mention-conversation": {
         const body = await this.readJson(req);
-        await this.chat.sendWithConversationMention(
-          {
+        if (body.windowId) windowId = body.windowId;
+        return rpc("mention-conversation", {
+          mention: {
             id: String(body.id ?? ""),
             title: body.title ? String(body.title) : undefined,
-            lastModifiedTime: body.lastModifiedTime
-              ? String(body.lastModifiedTime)
-              : undefined,
+            lastModifiedTime: body.lastModifiedTime ? String(body.lastModifiedTime) : undefined,
           },
-          String(body.text ?? "")
-        );
-        return this.json(res, 200, { ok: true });
+          text: String(body.text ?? ""),
+        });
       }
       case "switch": {
         const body = await this.readJson(req);
-        await this.chat.switchCascade(String(body.cascadeId ?? ""));
-        return this.json(res, 200, { ok: true });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("switch", { cascadeId: body.cascadeId });
       }
       case "select-model": {
         const body = await this.readJson(req);
-        const ok = await this.chat.selectModel(String(body.modelId ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("select-model", { modelId: body.modelId });
       }
       case "cancel":
-        return this.json(res, 200, { ok: await this.chat.cancel() });
+        return rpc("cancel");
       case "revert": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.revertToStep(stepIndex);
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("revert", { stepIndex: body.stepIndex });
       }
-
-      // ---- Interactive: ask-question / slash commands / plan approval ----
       case "answer-question": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        const answers = Array.isArray(body.answers) ? body.answers : [];
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.answerQuestion(
-          stepIndex,
-          answers.map((a: any) => ({
-            selectedOptionIds: Array.isArray(a?.selectedOptionIds)
-              ? a.selectedOptionIds.map(String)
-              : [],
-            freeText: a?.freeText ? String(a.freeText) : undefined,
-          }))
-        );
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("answer-question", {
+          stepIndex: body.stepIndex,
+          answers: body.answers,
+        });
       }
       case "skip-question": {
         const body = await this.readJson(req);
-        const stepIndex = Number(body.stepIndex);
-        if (!Number.isFinite(stepIndex)) {
-          return this.json(res, 400, { ok: false, error: "stepIndex required" });
-        }
-        const ok = await this.chat.skipQuestion(stepIndex);
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("skip-question", { stepIndex: body.stepIndex });
       }
       case "slash-commands":
-        return this.json(res, 200, {
-          commands: await this.chat.getSlashCommands(),
-        });
+        return rpc("slash-commands");
       case "approve-plan": {
         const body = await this.readJson(req);
-        const artifactUri = String(body.artifactUri ?? "");
-        if (!artifactUri) {
-          return this.json(res, 400, { ok: false, error: "artifactUri required" });
-        }
-        const ok = await this.chat.approvePlan(
-          artifactUri,
-          body.approved !== false
-        );
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("approve-plan", {
+          artifactUri: body.artifactUri,
+          approved: body.approved,
+        });
       }
+      case "stats":
+        return rpc("stats");
+      case "reset-stats":
+        return rpc("reset-stats");
 
-      // ---- File control ----
+      // Files
       case "files": {
         const rel = url.searchParams.get("path") ?? "";
-        return this.json(res, 200, {
-          root: FileController.root(),
-          entries: FileController.list(rel),
-        });
+        return rpc("files", { path: rel });
       }
       case "file": {
         if (req.method === "GET") {
           const rel = url.searchParams.get("path") ?? "";
-          return this.json(res, 200, FileController.read(rel));
+          return rpc("file-read", { path: rel });
         }
         if (req.method === "PUT" || req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            FileController.write(String(body.path ?? ""), String(body.text ?? ""))
-          );
+          if (body.windowId) windowId = body.windowId;
+          return rpc("file-write", { path: body.path, text: body.text });
         }
         if (req.method === "DELETE") {
           const rel = url.searchParams.get("path") ?? "";
-          return this.json(res, 200, FileController.delete(rel));
+          return rpc("file-delete", { path: rel });
         }
         break;
       }
       case "file-open": {
         const body = await this.readJson(req);
-        const ok = await FileController.openInEditor(String(body.path ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("file-open", { path: body.path });
       }
       case "upload": {
         const ct = String(req.headers["content-type"] ?? "");
         const buf = await this.readBody(req);
-        const { files } = this.parseMultipart(buf, ct);
+        const { fields, files } = this.parseMultipart(buf, ct);
+        const targetWinId = fields.windowId || windowId;
         const saved: string[] = [];
         const absPaths: string[] = [];
+
         for (const f of files) {
-          const r = FileController.saveUpload(f.filename, f.data);
-          if ("path" in r) {
-            saved.push(r.path);
-            absPaths.push(r.abs);
+          try {
+            const res = await this.windowManager.executeRpc(targetWinId, "file-upload", {
+              filename: f.filename,
+              dataBase64: f.data.toString("base64"),
+              subdir: fields.subdir || "uploads",
+            });
+            if (res && "path" in res) {
+              saved.push(res.path);
+              absPaths.push(res.abs);
+            }
+          } catch (e: any) {
+            this.opts.log(`[upload] error saving file to window ${targetWinId}: ${e?.message ?? e}`);
           }
         }
-        // We return the ABSOLUTE paths so the client can hold them as pending
-        // attachments and fold them into the next chat message (as @paths the
-        // Antigravity agent can actually open/read). No auto-send here.
         return this.json(res, 200, { saved, absPaths });
       }
 
-      // ---- Git / GitHub control ----
+      // Git
       case "git/status":
-        return this.json(res, 200, await GitController.status());
-      case "git/log":
-        return this.json(res, 200, {
-          commits: await GitController.log(
-            Number(url.searchParams.get("limit") ?? 20)
-          ),
-        });
+        return rpc("git/status");
+      case "git/log": {
+        const limit = Number(url.searchParams.get("limit") ?? 20);
+        return rpc("git/log", { limit });
+      }
       case "git/diff": {
         const file = url.searchParams.get("file") ?? undefined;
-        return this.json(res, 200, { diff: await GitController.diff(file) });
+        return rpc("git/diff", { file });
       }
       case "git/add": {
         const body = await this.readJson(req);
-        return this.json(res, 200, await GitController.add(body.files ?? "."));
+        if (body.windowId) windowId = body.windowId;
+        return rpc("git/add", { files: body.files });
       }
       case "git/commit": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.commit(String(body.message ?? ""))
-        );
+        if (body.windowId) windowId = body.windowId;
+        return rpc("git/commit", { message: body.message });
       }
       case "git/push": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.push(body.branch, body.setUpstream)
-        );
+        if (body.windowId) windowId = body.windowId;
+        return rpc("git/push", { branch: body.branch, setUpstream: body.setUpstream });
       }
       case "git/pull":
-        return this.json(res, 200, await GitController.pull());
-      case "git/branch":
+        return rpc("git/pull");
+      case "git/branch": {
         if (req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            await GitController.createBranch(String(body.name ?? ""))
-          );
+          if (body.windowId) windowId = body.windowId;
+          return rpc("git/branch-create", { name: body.name });
         }
-        return this.json(res, 200, { branches: await GitController.branches() });
+        return rpc("git/branch");
+      }
       case "git/checkout": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.checkout(String(body.branch ?? ""))
-        );
+        if (body.windowId) windowId = body.windowId;
+        return rpc("git/checkout", { branch: body.branch });
       }
       case "gh/pr-create": {
         const body = await this.readJson(req);
-        return this.json(
-          res,
-          200,
-          await GitController.createPR(
-            String(body.title ?? ""),
-            String(body.body ?? "")
-          )
-        );
+        if (body.windowId) windowId = body.windowId;
+        return rpc("gh/pr-create", { title: body.title, body: body.body });
       }
       case "gh/pr-list":
-        return this.json(res, 200, { prs: await GitController.listPRs() });
+        return rpc("gh/pr-list");
 
-      case "stats": {
-        const stats = this.chat.getTodayStats();
-        return this.json(res, 200, stats);
-      }
-      case "reset-stats": {
-        const stats = this.chat.resetTodayStats();
-        return this.json(res, 200, stats);
-      }
-
-      // ---- Media Serving ----
+      // Media Serving
       case "media": {
         const u = new URL(req.url ?? "", "http://localhost");
         let filePath = u.searchParams.get("path") || "";
@@ -585,7 +623,7 @@ export class RemoteServer {
         return;
       }
 
-      // ---- Settings / account / workspace ----
+      // Settings & Global
       case "account":
         return this.json(res, 200, SettingsController.account());
       case "switch-account": {
@@ -607,17 +645,12 @@ export class RemoteServer {
       }
       case "workspace": {
         if (req.method === "GET") {
-          return this.json(res, 200, {
-            current: SettingsController.currentWorkspace(),
-          });
+          return rpc("workspace");
         }
         if (req.method === "POST") {
           const body = await this.readJson(req);
-          return this.json(
-            res,
-            200,
-            await SettingsController.openWorkspace(String(body.path ?? ""))
-          );
+          if (body.windowId) windowId = body.windowId;
+          return rpc("workspace-open", { path: body.path });
         }
         break;
       }
@@ -626,13 +659,13 @@ export class RemoteServer {
         return this.json(res, 200, SettingsController.browse(dir));
       }
       case "workspace-folders":
-        return this.json(res, 200, SettingsController.workspaceFolders());
+        return rpc("workspace-folders");
       case "workspace-create": {
         if (req.method === "POST") {
           const body = await this.readJson(req);
           const name = String(body.name ?? "").trim();
           if (!name) return this.json(res, 400, { ok: false, error: "name required" });
-          
+
           try {
             const root = SettingsController.get().workspaceRoot;
             if (!root) throw new Error("Workspace root not configured");
@@ -647,30 +680,27 @@ export class RemoteServer {
         break;
       }
 
-      // ---- Terminal ----
+      // Terminal
       case "term/list":
-        return this.json(res, 200, { terminals: this.terminals.list() });
+        return rpc("term/list");
       case "term/create": {
         const body = await this.readJson(req);
-        const info = this.terminals.create(
-          body.cwd ? String(body.cwd) : undefined,
-          body.title ? String(body.title) : undefined
-        );
-        return this.json(res, 200, info);
+        if (body.windowId) windowId = body.windowId;
+        return rpc("term/create", { cwd: body.cwd, title: body.title });
       }
       case "term/input": {
         const body = await this.readJson(req);
-        const ok = this.terminals.write(String(body.id ?? ""), String(body.data ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("term/input", { id: body.id, data: body.data });
       }
       case "term/kill": {
         const body = await this.readJson(req);
-        const ok = this.terminals.kill(String(body.id ?? ""));
-        return this.json(res, 200, { ok });
+        if (body.windowId) windowId = body.windowId;
+        return rpc("term/kill", { id: body.id });
       }
       case "term/buffer": {
         const id = url.searchParams.get("id") ?? "";
-        return this.json(res, 200, { buffer: this.terminals.getBuffer(id) });
+        return rpc("term/buffer", { id });
       }
     }
 
@@ -681,7 +711,6 @@ export class RemoteServer {
     let rel = pathName === "/" ? "/index.html" : pathName;
     rel = rel.split("?")[0];
     const abs = path.join(this.opts.webRoot, rel);
-    // Prevent path traversal outside webRoot.
     if (!abs.startsWith(this.opts.webRoot)) {
       res.writeHead(403);
       res.end("forbidden");
@@ -689,7 +718,6 @@ export class RemoteServer {
     }
     fs.readFile(abs, (err, data) => {
       if (err) {
-        // SPA fallback -> index.html
         const indexPath = path.join(this.opts.webRoot, "index.html");
         fs.readFile(indexPath, (err2, idx) => {
           if (err2) {

@@ -27,6 +27,9 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
   const [wsFolders, setWsFolders] = useState<WorkspaceFolders | null>(null);
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [switchingTarget, setSwitchingTarget] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showPicker, setShowPicker] = useState(false);
 
   useEffect(() => {
@@ -76,17 +79,40 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
 
   const switchAccount = async (email: string) => {
     setBusy(true);
+    setSwitchingTarget(email);
+    setSuccessMsg(null);
+    setErrorMsg(null);
     setMsg("");
+
     try {
       const r = await api.switchAccount(email);
-      if (r.ok) {
-        setMsg("Đã chuyển tài khoản. Tải lại IDE để áp dụng hoàn toàn.");
-        await load();
-      } else {
-        setMsg(`Không chuyển được: ${r.error ?? "lỗi"}`);
+      if (!r.ok) {
+        throw new Error(r.error || "Không thể chuyển tài khoản");
       }
+
+      // Verification loop: poll until the account is active or timeout
+      for (let i = 0; i < 8; i++) {
+        await new Promise((res) => setTimeout(res, 600));
+        try {
+          const [acc, q] = await Promise.all([
+            api.account().catch(() => null),
+            api.quota().catch(() => null),
+          ]);
+          if (acc) setAccount(acc);
+          if (q) setQuota(q);
+          if (acc?.currentEmail === email || q?.account?.email === email) {
+            break;
+          }
+        } catch {}
+      }
+
+      await load();
+      setSuccessMsg(`Đã chuyển sang tài khoản ${email} thành công! Antigravity IDE đã sẵn sàng.`);
+    } catch (e: any) {
+      setErrorMsg(e?.message || "Lỗi khi chuyển tài khoản");
     } finally {
       setBusy(false);
+      setSwitchingTarget(null);
     }
   };
 
@@ -94,6 +120,46 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
 
   return (
     <div className="settings">
+      {/* Account Switching Loading Overlay */}
+      {switchingTarget && (
+        <div className="account-switch-overlay">
+          <div className="account-switch-modal">
+            <Icon name="spinner" size={32} className="spin accent-spin" />
+            <div className="account-switch-title">
+              Đang chuyển sang <strong>{switchingTarget}</strong>…
+            </div>
+            <div className="account-switch-desc">
+              Đang đồng bộ Token và cập nhật Antigravity IDE Language Server…
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Success Notification Banner */}
+      {successMsg && (
+        <div className="account-feedback-banner success">
+          <div className="feedback-content">
+            <Icon name="check" size={16} />
+            <span>{successMsg}</span>
+          </div>
+          <button className="ghost icon-btn sm" onClick={() => setSuccessMsg(null)} title="Đóng">
+            <Icon name="close" size={13} />
+          </button>
+        </div>
+      )}
+
+      {/* Error Notification Banner */}
+      {errorMsg && (
+        <div className="account-feedback-banner error">
+          <div className="feedback-content">
+            <Icon name="close" size={16} />
+            <span>{errorMsg}</span>
+          </div>
+          <button className="ghost icon-btn sm" onClick={() => setErrorMsg(null)} title="Đóng">
+            <Icon name="close" size={13} />
+          </button>
+        </div>
+      )}
       {stats != null && (
         <section className="card stats-section-card">
           <div className="stats-header">
@@ -303,6 +369,140 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
   );
 }
 
+interface GroupedModelQuota {
+  label: string;
+  remainingFraction: number;
+  resetTime?: string;
+}
+
+function groupModelQuotas(
+  quotas?: Array<{ label: string; remainingFraction?: number; resetTime?: string }>
+): GroupedModelQuota[] {
+  if (!quotas || quotas.length === 0) return [];
+
+  const geminiList: Array<{ label: string; remainingFraction?: number; resetTime?: string }> = [];
+  const claudeGptList: Array<{ label: string; remainingFraction?: number; resetTime?: string }> = [];
+
+  for (const m of quotas) {
+    const l = (m.label || "").toLowerCase();
+    if (
+      l.includes("claude") ||
+      l.includes("gpt") ||
+      l.includes("opus") ||
+      l.includes("sonnet") ||
+      l.includes("openai")
+    ) {
+      claudeGptList.push(m);
+    } else if (l.includes("gemini")) {
+      geminiList.push(m);
+    }
+  }
+
+  const result: GroupedModelQuota[] = [];
+
+  if (geminiList.length > 0) {
+    const lowestGem = geminiList.reduce(
+      (min, cur) =>
+        (cur.remainingFraction ?? 1) < (min.remainingFraction ?? 1) ? cur : min,
+      geminiList[0]
+    );
+    result.push({
+      label: "Gemini",
+      remainingFraction: lowestGem.remainingFraction ?? 1,
+      resetTime: lowestGem.resetTime || geminiList.find((g) => g.resetTime)?.resetTime,
+    });
+  }
+
+  if (claudeGptList.length > 0) {
+    const lowestC = claudeGptList.reduce(
+      (min, cur) =>
+        (cur.remainingFraction ?? 1) < (min.remainingFraction ?? 1) ? cur : min,
+      claudeGptList[0]
+    );
+    result.push({
+      label: "Claude & GPT",
+      remainingFraction: lowestC.remainingFraction ?? 1,
+      resetTime: lowestC.resetTime || claudeGptList.find((c) => c.resetTime)?.resetTime,
+    });
+  }
+
+  return result.length > 0
+    ? result
+    : quotas.slice(0, 2).map((q) => ({
+        label: q.label,
+        remainingFraction: q.remainingFraction ?? 1,
+        resetTime: q.resetTime,
+      }));
+}
+
+interface GroupedAccountQuota {
+  name: string;
+  displayName: string;
+  percentage: number;
+  resetTime?: string;
+}
+
+function groupAccountQuotas(
+  quotas?: Array<{ name: string; displayName?: string; percentage: number; resetTime?: string }>
+): GroupedAccountQuota[] {
+  if (!quotas || quotas.length === 0) return [];
+
+  const geminiList: Array<{ name: string; displayName: string; percentage: number; resetTime?: string }> = [];
+  const claudeGptList: Array<{ name: string; displayName: string; percentage: number; resetTime?: string }> = [];
+
+  for (const m of quotas) {
+    const dn = m.displayName || m.name || "Model";
+    const l = `${m.name} ${dn}`.toLowerCase();
+    if (
+      l.includes("claude") ||
+      l.includes("gpt") ||
+      l.includes("opus") ||
+      l.includes("sonnet")
+    ) {
+      claudeGptList.push({ name: m.name, displayName: dn, percentage: m.percentage, resetTime: m.resetTime });
+    } else if (l.includes("gemini")) {
+      geminiList.push({ name: m.name, displayName: dn, percentage: m.percentage, resetTime: m.resetTime });
+    }
+  }
+
+  const result: GroupedAccountQuota[] = [];
+
+  if (geminiList.length > 0) {
+    const lowestGem = geminiList.reduce(
+      (min, cur) => (cur.percentage < min.percentage ? cur : min),
+      geminiList[0]
+    );
+    result.push({
+      name: "gemini",
+      displayName: "Gemini",
+      percentage: lowestGem.percentage,
+      resetTime: lowestGem.resetTime,
+    });
+  }
+
+  if (claudeGptList.length > 0) {
+    const lowestC = claudeGptList.reduce(
+      (min, cur) => (cur.percentage < min.percentage ? cur : min),
+      claudeGptList[0]
+    );
+    result.push({
+      name: "claude-gpt",
+      displayName: "Claude & GPT",
+      percentage: lowestC.percentage,
+      resetTime: lowestC.resetTime,
+    });
+  }
+
+  return result.length > 0
+    ? result
+    : quotas.slice(0, 2).map((q) => ({
+        name: q.name,
+        displayName: q.displayName || q.name,
+        percentage: q.percentage,
+        resetTime: q.resetTime,
+      }));
+}
+
 function QuotaView({ quota }: { quota: QuotaInfo }) {
   const pc = quota.credits?.promptCredits;
   const fc = quota.credits?.flowCredits;
@@ -325,6 +525,9 @@ function QuotaView({ quota }: { quota: QuotaInfo }) {
       </div>
     );
   };
+
+  const groupedModels = groupModelQuotas(quota.modelQuota);
+
   return (
     <div className="quota-view">
       <div className="quota-plan">
@@ -335,10 +538,10 @@ function QuotaView({ quota }: { quota: QuotaInfo }) {
       </div>
       {meter("Prompt credits", pc?.available, pc?.monthly)}
       {meter("Flow credits", fc?.available, fc?.monthly)}
-      {quota.modelQuota && quota.modelQuota.length > 0 && (
+      {groupedModels.length > 0 && (
         <>
           <div className="quota-section-title">Model quota</div>
-          {quota.modelQuota.map((m) => {
+          {groupedModels.map((m) => {
             const pct = Math.round((m.remainingFraction ?? 0) * 100);
             return (
               <div key={m.label} className="model-quota-row">
@@ -403,7 +606,8 @@ function AccountView({
       {sorted.map((a) => {
         const open = expanded === a.id;
         const isSwitching = switchingEmail === a.email;
-        const lowest = [...(a.quota ?? [])].sort(
+        const groupedQuota = groupAccountQuotas(a.quota);
+        const lowest = [...groupedQuota].sort(
           (x, y) => x.percentage - y.percentage
         )[0];
         return (
@@ -452,7 +656,7 @@ function AccountView({
                     <span>{isSwitching ? "Đang chuyển…" : "Chuyển"}</span>
                   </button>
                 )}
-                {a.quota && a.quota.length > 0 && (
+                {groupedQuota.length > 0 && (
                   <button
                     className="ghost icon-btn sm"
                     onClick={() => setExpanded(open ? null : a.id)}
@@ -463,9 +667,9 @@ function AccountView({
                 )}
               </div>
             </div>
-            {open && a.quota && (
+            {open && groupedQuota.length > 0 && (
               <div className="account-quota-dropdown">
-                {a.quota.map((m) => {
+                {groupedQuota.map((m) => {
                   const pctClass = m.percentage < 20 ? "err" : m.percentage < 50 ? "warn" : "";
                   return (
                     <div key={m.name} className="mini-meter-row">

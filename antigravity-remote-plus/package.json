@@ -117,11 +117,13 @@
     }
   },
   "scripts": {
+    "typecheck": "tsc --noEmit && cd web && pnpm run typecheck",
     "build:web": "cd web && pnpm run build",
-    "build:ext": "node esbuild.js",
-    "build": "pnpm run build:web && pnpm run build:ext",
+    "build:ext": "tsc --noEmit && node esbuild.js",
+    "build": "pnpm run typecheck && pnpm run build:web && pnpm run build:ext",
     "watch": "node esbuild.js --watch",
-    "package": "pnpm run build && npx @vscode/vsce package --no-dependencies -o antigravity-remote-plus.vsix"
+    "package": "pnpm run typecheck && pnpm run build && npx @vscode/vsce package --no-dependencies -o antigravity-remote-plus.vsix && node scripts/install-and-reload.js",
+    "install:ext": "node scripts/install-and-reload.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

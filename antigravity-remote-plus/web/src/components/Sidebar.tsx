@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, type Trajectory } from "../api";
+import { api, type Trajectory, type IdeWindowInfo } from "../api";
 import { Icon } from "./Icon";
 
 export interface WsFolder {
@@ -11,10 +11,13 @@ export interface WsFolder {
 interface Props {
   trajectories: Trajectory[];
   wsFolders: WsFolder[];
+  windows?: IdeWindowInfo[];
+  activeWindowId?: string | null;
   activeId: string;
   activeWs: string | null;
   pendingChat?: boolean;
   onSelectWs: (ws: string | null) => void;
+  onSelectWindow?: (windowId: string) => void;
   onSwitch: (id: string, wsUri?: string, wsName?: string) => void | Promise<void>;
   onNewChat: () => void | Promise<void>;
   onOpenWorkspace: (path: string) => void | Promise<void>;
@@ -28,39 +31,52 @@ interface WsEntry {
   items: Trajectory[];
 }
 
-// Turn "/Users/x/Documents/proj" into "file:///Users/x/Documents/proj".
 function pathToUri(p: string): string {
-  return "file://" + p;
+  return p.startsWith("file://") ? p : "file://" + p;
 }
 
-// Merge two sources into one workspace list:
-//   1. folders scanned under the configured workspace root (always shown, even
-//      with zero conversations)
-//   2. workspaces referenced by existing conversations (so chats outside the
-//      root still appear)
+function normalizeKey(k?: string | null): string {
+  if (!k || k === "__none__") return "__none__";
+  try {
+    return decodeURIComponent(k.replace(/\/+$/, "")).toLowerCase();
+  } catch {
+    return k.replace(/\/+$/, "").toLowerCase();
+  }
+}
+
 function buildWorkspaces(
   folders: WsFolder[],
   trajectories: Trajectory[]
 ): WsEntry[] {
   const map = new Map<string, WsEntry>();
 
-  // Seed from scanned root folders.
   for (const f of folders) {
-    const key = pathToUri(f.path);
-    map.set(key, { key, name: f.name, path: f.path, items: [] });
+    const rawKey = pathToUri(f.path);
+    const norm = normalizeKey(rawKey);
+    map.set(norm, { key: rawKey, name: f.name, path: f.path, items: [] });
   }
 
-  // Attach conversations to their workspace, creating entries as needed.
   for (const t of trajectories) {
-    const key = t.workspaceUri || "__none__";
-    let e = map.get(key);
+    const rawKey = t.workspaceUri || "__none__";
+    const norm = normalizeKey(rawKey);
+    let e = map.get(norm);
     if (!e) {
       const name =
-        t.workspaceName || (key === "__none__" ? "Khác" : key.replace(/^file:\/\//, ""));
-      e = { key, name, path: key === "__none__" ? null : key.replace(/^file:\/\//, ""), items: [] };
-      map.set(key, e);
+        t.workspaceName ||
+        (rawKey === "__none__"
+          ? "Khác"
+          : decodeURIComponent(rawKey.replace(/^file:\/\//, "").split("/").pop() || "Khác"));
+      e = {
+        key: rawKey,
+        name,
+        path: rawKey === "__none__" ? null : rawKey.replace(/^file:\/\//, ""),
+        items: [],
+      };
+      map.set(norm, e);
     }
-    e.items.push(t);
+    if (!e.items.some((i) => i.id === t.id)) {
+      e.items.push(t);
+    }
   }
 
   return [...map.values()].sort((a, b) => {
@@ -73,10 +89,13 @@ function buildWorkspaces(
 export function Sidebar({
   trajectories,
   wsFolders,
+  windows = [],
+  activeWindowId,
   activeId,
   activeWs,
   pendingChat,
   onSelectWs,
+  onSelectWindow,
   onSwitch,
   onNewChat,
   onOpenWorkspace,
@@ -86,7 +105,14 @@ export function Sidebar({
     () => buildWorkspaces(wsFolders, trajectories),
     [wsFolders, trajectories]
   );
-  const current = activeWs ? workspaces.find((w) => w.key === activeWs) : null;
+  const normActiveWs = normalizeKey(activeWs);
+  const current = activeWs
+    ? workspaces.find(
+        (w) =>
+          normalizeKey(w.key) === normActiveWs ||
+          (w.path && normalizeKey("file://" + w.path) === normActiveWs)
+      )
+    : null;
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newWsName, setNewWsName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -125,7 +151,50 @@ export function Sidebar({
             <Icon name="refresh" size={16} />
           </button>
         </div>
+
         <div className="side-body">
+          {/* Live Open IDE Windows */}
+          {windows.length > 1 && (
+            <div className="sidebar-windows-section">
+              <div className="side-section-header">
+                <Icon name="server" size={13} />
+                <span>IDE đang mở ({windows.length})</span>
+              </div>
+              <ul className="ws-list live-win-list">
+                {windows.map((win) => {
+                  const isAct = win.id === activeWindowId;
+                  const winGen = win.isGenerating;
+                  const statusClass = winGen
+                    ? "status-generating"
+                    : win.statusText && win.statusText !== "Idle"
+                    ? "status-busy"
+                    : "status-idle";
+
+                  return (
+                    <li key={win.id}>
+                      <button
+                        className={`ws-pick live-win-pick ${isAct ? "active" : ""}`}
+                        onClick={() => {
+                          onSelectWindow?.(win.id);
+                          if (win.workspacePath) {
+                            onSelectWs("file://" + win.workspacePath);
+                          }
+                        }}
+                      >
+                        <span className={`window-status-dot ${statusClass}`} />
+                        <span className="ws-name">{win.workspaceName || win.title}</span>
+                        {win.isHost && <span className="window-host-tag">Host</span>}
+                        {isAct && <span className="window-active-tag">Active</span>}
+                        <Icon name="chevronRight" size={14} className="chev" />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="side-divider" />
+            </div>
+          )}
+
           {workspaces.length === 0 && (
             <div className="side-empty">
               Chưa có workspace. Đặt "Thư mục chứa workspace" trong Cài đặt.
@@ -209,7 +278,6 @@ export function Sidebar({
         <button
           className="primary icon-btn full"
           onClick={() => {
-            // Make sure the IDE is on this workspace, then start a new chat.
             if (current.path) onOpenWorkspace(current.path);
             onNewChat();
           }}

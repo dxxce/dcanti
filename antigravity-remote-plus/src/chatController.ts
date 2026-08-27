@@ -63,10 +63,21 @@ export interface ChatState {
   messages: ChatMessage[];
 }
 
+export interface ModelInfo {
+  id: string;
+  label: string;
+  selected?: boolean;
+  recommended?: boolean;
+  remainingFraction?: number;
+  resetTime?: string;
+}
+
 export type ChatEvent =
   | { type: "state"; state: ChatState }
   | { type: "state_update"; cascadeId: string; generating: boolean; statusText: string; lastMessage: any }
   | { type: "status"; cascadeId: string; generating: boolean; statusText: string }
+  | { type: "models"; models: ModelInfo[] }
+  | { type: "quota"; quota: any }
   | { type: "stats_update"; stats: any }
   | { type: "trajectories"; list: Trajectory[] };
 
@@ -185,23 +196,10 @@ export class ChatController {
   }
 
   // ---- Discover the currently active cascade id ----
-  // LS is the source of truth: GetAllCascadeTrajectories returns the same data
-  // the IDE panel renders, so picking from it keeps IDE and web in sync.
   async resolveActiveCascadeId(): Promise<string> {
-    // If the user has explicitly chosen a conversation (or is in a pending new
-    // chat), never override it here — return whatever is currently set.
     if (this.userSelected && this.activeCascadeId) return this.activeCascadeId;
-    const list = await this.ls.getAllTrajectories();
-    if (list.length > 0) {
-      // Prefer a cascade that is actively running; otherwise the most recently
-      // modified one (list is already sorted newest-first).
-      const running = list.find((t) =>
-        String(t.status ?? "").toUpperCase().includes("RUNNING")
-      );
-      this.activeCascadeId = (running ?? list[0]).id;
-      return this.activeCascadeId;
-    }
-    // Last resort: ask the IDE via diagnostics.
+
+    // 1. Ask the IDE diagnostics for this specific window first
     try {
       const diag: any = await vscode.commands.executeCommand(
         "antigravity.getDiagnostics"
@@ -210,10 +208,40 @@ export class ChatController {
         diag?.recentTrajectories?.[0]?.googleAgentId ??
         diag?.recentTrajectories?.[0]?.cascadeId ??
         "";
-      if (id) this.activeCascadeId = String(id);
+      if (id) {
+        this.activeCascadeId = String(id);
+        return this.activeCascadeId;
+      }
     } catch {
       /* command may not exist in all builds */
     }
+
+    // 2. Query trajectories and filter by current window workspace folder
+    const list = await this.ls.getAllTrajectories();
+    if (list.length > 0) {
+      const folders = vscode.workspace.workspaceFolders;
+      const curWsUri = folders?.[0]?.uri?.toString();
+      const normCur = curWsUri ? decodeURIComponent(curWsUri.replace(/\/+$/, "")).toLowerCase() : "";
+
+      let targetList = list;
+      if (normCur) {
+        const filtered = list.filter((t) => {
+          if (!t.workspaceUri) return false;
+          const normT = decodeURIComponent(t.workspaceUri.replace(/\/+$/, "")).toLowerCase();
+          return normT === normCur || normCur.includes(normT) || normT.includes(normCur);
+        });
+        if (filtered.length > 0) targetList = filtered;
+      }
+
+      // Prefer a cascade that is actively running; otherwise the most recently
+      // modified one for this workspace.
+      const running = targetList.find((t) =>
+        String(t.status ?? "").toUpperCase().includes("RUNNING")
+      );
+      this.activeCascadeId = (running ?? targetList[0]).id;
+      return this.activeCascadeId;
+    }
+
     return this.activeCascadeId;
   }
 
@@ -871,9 +899,24 @@ export class ChatController {
       }
     }
     if (generating !== this.lastGenerating || statusText !== this.lastStatusText) {
+      const wasGenerating = this.lastGenerating;
       this.lastGenerating = generating;
       this.lastStatusText = statusText;
       this.emit({ type: "status", cascadeId: id, generating, statusText });
+
+      // When the agent reply ends (transition from generating to not generating)
+      if (wasGenerating && !generating) {
+        this.getModels()
+          .then((models) => {
+            if (models && models.length > 0) this.emit({ type: "models", models });
+          })
+          .catch(() => {});
+        this.getQuota()
+          .then((quota) => {
+            if (quota) this.emit({ type: "quota", quota });
+          })
+          .catch(() => {});
+      }
     }
   }
 }
