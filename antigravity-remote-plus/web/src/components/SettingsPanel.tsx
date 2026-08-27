@@ -191,7 +191,7 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
                 <div className="stat-icon-wrapper"><Icon name="clock" size={18} /></div>
                 <div className="stat-info">
                   <span className="stat-value">{fmtDuration(stats.totalDurationMs)}</span>
-                  <span className="stat-label">Thời gian</span>
+                  <span className="stat-label">Tổng thời gian Agent xử lý</span>
                 </div>
               </div>
             </div>

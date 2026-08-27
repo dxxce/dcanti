@@ -27,7 +27,7 @@ async function req<T>(
       ...authHeaders(),
       ...(opts.headers ?? {}),
     },
-    credentials: "same-origin",
+    credentials: "include",
   });
   if (res.status === 401) {
     throw new UnauthorizedError();
@@ -64,6 +64,7 @@ export interface ChatMessage {
   // Tool rows carry a coarse kind (for icon/grouping) + optional short detail.
   kind?: string;
   detail?: string;
+  images?: string[];
   // User messages carry their trajectory stepIndex for per-message revert.
   stepIndex?: number;
   questions?: Array<{

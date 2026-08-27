@@ -72,7 +72,12 @@ export function App() {
 
   // Multi-window state
   const [windows, setWindows] = useState<IdeWindowInfo[]>([]);
+  const windowsRef = useRef<IdeWindowInfo[]>([]);
+  windowsRef.current = windows;
+
   const [activeWindowId, setActiveWindowId] = useState<string | null>(null);
+  const activeWindowIdRef = useRef<string | null>(null);
+  activeWindowIdRef.current = activeWindowId;
 
   const [state, setState] = useState<ChatState>(EMPTY_STATE);
   const [trajectories, setTrajectories] = useState<Trajectory[]>([]);
@@ -90,6 +95,10 @@ export function App() {
   useEffect(() => {
     (async () => {
       try {
+        // Probe auth first with an unswallowed API call
+        const sRes = await api.state();
+        setAuthed(true);
+
         const winRes = await api.windows().catch(() => null);
         if (winRes?.windows && winRes.windows.length > 0) {
           setWindows(winRes.windows);
@@ -100,10 +109,7 @@ export function App() {
             setActiveWs("file://" + initialWin.workspacePath);
           }
         }
-        const [tRes, sRes] = await Promise.all([
-          api.trajectories().catch(() => ({ list: [] })),
-          api.state().catch(() => EMPTY_STATE),
-        ]);
+        const tRes = await api.trajectories().catch(() => ({ list: [] }));
         setTrajectories(tRes.list);
         if (sRes && sRes.cascadeId && sRes.messages && sRes.messages.length > 0) {
           setState(sRes);
@@ -113,9 +119,8 @@ export function App() {
             if (s && s.cascadeId) setState(s);
           }).catch(() => {});
         }
-        setAuthed(true);
       } catch (e) {
-        if (e instanceof UnauthorizedError) setAuthed(false);
+        setAuthed(false);
       } finally {
         setChecking(false);
       }
@@ -139,8 +144,13 @@ export function App() {
       setModels(m.models);
       setWsFolders(wf.folders);
       if (s) setStats(s);
-      if (liveState && liveState.cascadeId && liveState.messages && liveState.messages.length > 0) {
-        setState((prev) => (!prev.cascadeId ? liveState : prev));
+      if (liveState && liveState.cascadeId) {
+        setState((prev) => {
+          if (!prev.cascadeId || prev.cascadeId === liveState.cascadeId) {
+            return liveState;
+          }
+          return prev;
+        });
       }
     } catch {
       /* non-fatal */
@@ -177,11 +187,12 @@ export function App() {
   // Switch active IDE window
   const handleSelectWindow = async (windowId: string) => {
     setActiveWindowId(windowId);
+    activeWindowIdRef.current = windowId;
     api.setWindowId(windowId);
     localStorage.setItem("arp_active_window_id", windowId);
     
     // Find window to update workspace selection
-    const targetWin = windows.find((w) => w.id === windowId);
+    const targetWin = windowsRef.current.find((w) => w.id === windowId);
     if (targetWin?.workspacePath) {
       localStorage.setItem("arp_active_window_path", targetWin.workspacePath);
       setActiveWs("file://" + targetWin.workspacePath);
@@ -220,91 +231,94 @@ export function App() {
     return () => clearInterval(iv);
   }, [switchingTo, refreshAux]);
 
-  const onEvent = useCallback(
-    (e: ServerEvent) => {
-      if (e.type === "windows") {
-        setWindows(e.windows);
-        if (
-          (!activeWindowId || !e.windows.some((w) => w.id === activeWindowId)) &&
-          e.windows.length > 0
-        ) {
-          const nextWin = getInitialWindow(e.windows);
-          setActiveWindowId(nextWin.id);
-          api.setWindowId(nextWin.id);
-          if (nextWin.workspacePath) {
-            setActiveWs("file://" + nextWin.workspacePath);
-          }
-        }
-        return;
-      }
+  const onEvent = useCallback((e: ServerEvent) => {
+    console.log("SSE EVENT:", e.type, e);
+    const curActiveId = activeWindowIdRef.current;
+    const curWindows = windowsRef.current;
 
-      // Update generating state in windows array if windowId provided
-      if (e.windowId) {
-        setWindows((prev) =>
-          prev.map((win) => {
-            if (win.id !== e.windowId) return win;
-            if (e.type === "state") {
-              return {
-                ...win,
-                isGenerating: !!e.state.generating,
-                statusText: e.state.statusText || "Idle",
-                activeCascadeId: e.state.cascadeId,
-              };
-            }
-            if (e.type === "state_update" || e.type === "status") {
-              return {
-                ...win,
-                isGenerating: !!e.generating,
-                statusText: e.statusText || "Idle",
-                activeCascadeId: e.cascadeId,
-              };
-            }
-            return win;
-          })
-        );
-      }
-
-      // If event belongs to another window, don't overwrite current view
-      if (e.windowId && activeWindowId && e.windowId !== activeWindowId) {
-        return;
-      }
-
-      if (e.type === "state") {
-        setState(e.state);
-        if (e.state.cascadeId) setPendingChat(false);
-      } else if (e.type === "state_update") {
-        setState((prev) => {
-          if (!prev || prev.cascadeId !== e.cascadeId || prev.messages.length === 0) return prev;
-          const newMsgs = [...prev.messages];
-          newMsgs[newMsgs.length - 1] = e.lastMessage;
-          return { ...prev, messages: newMsgs, generating: e.generating, statusText: e.statusText };
-        });
-      } else if (e.type === "status") {
-        setState((prev) => ({
-          ...prev,
-          cascadeId: e.cascadeId,
-          generating: e.generating,
-          statusText: e.statusText,
-        }));
-        if (!e.generating) {
-          api.models().then((r) => setModels(r.models)).catch(() => {});
-        }
-      } else if (e.type === "models") {
-        setModels(e.models);
-      } else if (e.type === "trajectories") {
-        setTrajectories(e.list);
-      } else if (
-        e.type === "term-data" ||
-        e.type === "term-exit" ||
-        e.type === "term-list"
+    if (e.type === "windows") {
+      setWindows(e.windows);
+      windowsRef.current = e.windows;
+      if (
+        (!curActiveId || !e.windows.some((w) => w.id === curActiveId)) &&
+        e.windows.length > 0
       ) {
-        termBus.emit(e);
-      } else if (e.type === "stats_update" && (e as any).stats) {
-        setStats((e as any).stats);
+        const nextWin = getInitialWindow(e.windows);
+        setActiveWindowId(nextWin.id);
+        activeWindowIdRef.current = nextWin.id;
+        api.setWindowId(nextWin.id);
+        if (nextWin.workspacePath) {
+          setActiveWs("file://" + nextWin.workspacePath);
+        }
       }
-    },
-    [activeWindowId]
-  );
+      return;
+    }
+
+    // Update generating state in windows array if windowId provided
+    if (e.windowId) {
+      setWindows((prev) =>
+        prev.map((win) => {
+          if (win.id !== e.windowId) return win;
+          if (e.type === "state") {
+            return {
+              ...win,
+              isGenerating: !!e.state.generating,
+              statusText: e.state.statusText || "Idle",
+              activeCascadeId: e.state.cascadeId,
+            };
+          }
+          if (e.type === "state_update" || e.type === "status") {
+            return {
+              ...win,
+              isGenerating: !!e.generating,
+              statusText: e.statusText || "Idle",
+              activeCascadeId: e.cascadeId,
+            };
+          }
+          return win;
+        })
+      );
+    }
+
+    // If event belongs to another window when multiple windows exist, don't overwrite current view
+    if (e.windowId && curActiveId && e.windowId !== curActiveId && curWindows.length > 1) {
+      return;
+    }
+
+    if (e.type === "state") {
+      setState(e.state);
+      if (e.state.cascadeId) setPendingChat(false);
+    } else if (e.type === "state_update") {
+      setState((prev) => {
+        if (!prev || prev.cascadeId !== e.cascadeId || prev.messages.length === 0) return prev;
+        const newMsgs = [...prev.messages];
+        newMsgs[newMsgs.length - 1] = e.lastMessage;
+        return { ...prev, messages: newMsgs, generating: e.generating, statusText: e.statusText };
+      });
+    } else if (e.type === "status") {
+      setState((prev) => ({
+        ...prev,
+        cascadeId: e.cascadeId,
+        generating: e.generating,
+        statusText: e.statusText,
+      }));
+      if (!e.generating) {
+        api.models().then((r) => setModels(r.models)).catch(() => {});
+      }
+    } else if (e.type === "models") {
+      setModels(e.models);
+    } else if (e.type === "trajectories") {
+      setTrajectories(e.list);
+    } else if (
+      e.type === "term-data" ||
+      e.type === "term-exit" ||
+      e.type === "term-list"
+    ) {
+      termBus.emit(e);
+    } else if (e.type === "stats_update" && (e as any).stats) {
+      setStats((e as any).stats);
+    }
+  }, []);
 
   useEvents(onEvent, authed);
 
@@ -330,10 +344,17 @@ export function App() {
 
   const send = async (text: string, images?: string[]) => {
     setError("");
+    setPendingChat(false);
+    setState((prev) => ({
+      ...prev,
+      generating: true,
+      statusText: "Đang xử lý...",
+    }));
     try {
       await api.send(text, images);
     } catch (e: any) {
       setError(String(e?.message ?? e));
+      setState((prev) => ({ ...prev, generating: false, statusText: "Idle" }));
     }
   };
 
@@ -412,7 +433,6 @@ export function App() {
   );
 
   const renderWsContent = () => {
-    if (!activeWs) return pickPrompt;
     return (
       <>
         <div style={{ display: tab === "chat" ? "contents" : "none" }}>
@@ -420,15 +440,25 @@ export function App() {
             state={state}
             models={models}
             onSend={send}
-            onCancel={() => {
-              api.cancel();
+            onCancel={async () => {
+              setState((prev) => ({ ...prev, generating: false, statusText: "Idle" }));
+              try {
+                await api.cancel();
+              } catch {}
             }}
-            onRevert={(stepIndex: number) => {
-              api.revert(stepIndex);
+            onRevert={async (stepIndex: number) => {
+              await api.revert(stepIndex);
+              const s = await api.state().catch(() => null);
+              if (s && s.cascadeId) setState(s);
             }}
             onSelectModel={selectModel}
             onSlashCommand={(name, modelFacingText, text) => {
               setPendingChat(false);
+              setState((prev) => ({
+                ...prev,
+                generating: true,
+                statusText: "Đang xử lý...",
+              }));
               api.slashCommand(name, modelFacingText, text);
             }}
             onApprovePlan={(artifactUri, approved) => {

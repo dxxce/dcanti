@@ -246,6 +246,7 @@ export class LsClient {
   private conn: LsConnection | null = null;
   private discovering: Promise<LsConnection | null> | null = null;
   private log: (msg: string) => void;
+  private stepCache = new Map<string, any[]>();
 
   constructor(log: (msg: string) => void = () => {}) {
     this.log = log;
@@ -269,9 +270,11 @@ export class LsClient {
       const conn = await probePort(port, proc.csrfToken);
       if (conn) {
         conn.pid = proc.pid;
-        this.log(
-          `[LS] connected: pid=${proc.pid} port=${port} tls=${conn.useTls}`
-        );
+        if (!this.conn || this.conn.pid !== proc.pid || this.conn.port !== port) {
+          this.log(
+            `[LS] connected: pid=${proc.pid} port=${port} tls=${conn.useTls}`
+          );
+        }
         return conn;
       }
     }
@@ -440,83 +443,139 @@ export class LsClient {
     return list;
   }
 
-  async getTrajectory(cascadeId: string): Promise<any | null> {
-    // Try LS RPC first
-    try {
-      const body = await this.call("GetCascadeTrajectory", { cascadeId });
-      if (body) {
-        const parsed = JSON.parse(body);
-        if (parsed?.trajectory?.steps && parsed.trajectory.steps.length > 0) {
-          return parsed;
-        }
-      }
-    } catch {}
+  private transcriptCache = new Map<string, { mtime: number; steps: any[] }>();
 
-    // Fallback: Read transcript from disk
+  async getTrajectory(cascadeId: string): Promise<any | null> {
+    let allSteps: any[] = [];
+
+    // 1. Read historical transcript from disk cache or reload if modified
     try {
       const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
       const transcriptPath = path.join(brainDir, cascadeId, ".system_generated", "logs", "transcript.jsonl");
       if (fs.existsSync(transcriptPath)) {
-        const raw = fs.readFileSync(transcriptPath, "utf8");
-        const lines = raw.split("\n");
-        const steps: any[] = [];
+        const stat = fs.statSync(transcriptPath);
+        const cached = this.transcriptCache.get(cascadeId);
+        if (cached && cached.mtime === stat.mtimeMs) {
+          allSteps = [...cached.steps];
+        } else {
+          const raw = fs.readFileSync(transcriptPath, "utf8");
+          const lines = raw.split("\n");
+          let lastPlannerToolCalls: any = null;
+          const parsedSteps: any[] = [];
 
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.type === "USER_INPUT") {
-              let userText = parsed.content || "";
-              const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
-              if (req) userText = req[1];
-              steps.push({
-                type: "CORTEX_STEP_TYPE_USER_INPUT",
-                status: "CORTEX_STEP_STATUS_DONE",
-                userInput: { userResponse: userText },
-                metadata: {
-                  sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? steps.length },
-                  createdAt: parsed.created_at,
-                },
-              });
-            } else if (parsed.type === "PLANNER_RESPONSE") {
-              steps.push({
-                type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
-                status: "CORTEX_STEP_STATUS_DONE",
-                plannerResponse: {
-                  response: parsed.content || "",
-                  toolCalls: parsed.tool_calls,
-                },
-                metadata: {
-                  createdAt: parsed.created_at,
-                },
-              });
-            } else if (parsed.type === "TOOL_CALL" || parsed.tool_calls) {
-              const tc = parsed.tool_calls?.[0];
-              steps.push({
-                type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
-                status: "CORTEX_STEP_STATUS_DONE",
-                content: parsed.content,
-                metadata: {
-                  toolAction: tc?.name,
-                  toolSummary: tc?.toolSummary,
-                  toolCall: { argumentsJson: JSON.stringify(tc?.parameters || {}) },
-                  createdAt: parsed.created_at,
-                },
-              });
-            }
-          } catch {}
-        }
-
-        if (steps.length > 0) {
-          return {
-            trajectory: {
-              trajectoryId: cascadeId,
-              steps,
-            },
-          };
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.type === "USER_INPUT") {
+                let userText = parsed.content || "";
+                const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+                if (req) userText = req[1];
+                parsedSteps.push({
+                  type: "CORTEX_STEP_TYPE_USER_INPUT",
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  userInput: { userResponse: userText },
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    createdAt: parsed.created_at,
+                  },
+                });
+              } else if (parsed.type === "PLANNER_RESPONSE") {
+                lastPlannerToolCalls = parsed.tool_calls;
+                parsedSteps.push({
+                  type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  plannerResponse: {
+                    response: parsed.content || "",
+                    toolCalls: parsed.tool_calls,
+                  },
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    createdAt: parsed.created_at,
+                  },
+                });
+              } else if (
+                parsed.type !== "CHECKPOINT" &&
+                parsed.type !== "CONVERSATION_HISTORY" &&
+                parsed.type !== "SYSTEM_MESSAGE" &&
+                parsed.type !== "EPHEMERAL_MESSAGE"
+              ) {
+                const tc = parsed.tool_calls?.[0] || lastPlannerToolCalls?.[0];
+                parsedSteps.push({
+                  type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  content: parsed.content,
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    toolAction: tc?.name || parsed.type,
+                    toolSummary: tc?.toolSummary || tc?.args?.toolSummary?.replace(/"/g, ""),
+                    toolCall: { argumentsJson: JSON.stringify(tc?.parameters || tc?.args || tc?.arguments || {}) },
+                    createdAt: parsed.created_at,
+                  },
+                });
+                lastPlannerToolCalls = null; // consume it
+              }
+            } catch {}
+          }
+          this.transcriptCache.set(cascadeId, { mtime: stat.mtimeMs, steps: parsedSteps });
+          allSteps = [...parsedSteps];
         }
       }
     } catch {}
+
+    // 2. Fetch LS RPC GetCascadeTrajectory for live streaming chunks and merge
+    let trajectoryStatus: string | undefined;
+    try {
+      const body = await this.call("GetCascadeTrajectory", { cascadeId });
+      if (body) {
+        const parsed = JSON.parse(body);
+        trajectoryStatus = parsed?.trajectory?.status ?? parsed?.status;
+        const rpcSteps = parsed?.trajectory?.steps || [];
+        if (Array.isArray(rpcSteps) && rpcSteps.length > 0) {
+          if (allSteps.length === 0) {
+            return parsed;
+          }
+          for (const rpc of rpcSteps) {
+            const idx =
+              rpc.metadata?.sourceTrajectoryStepInfo?.stepIndex ??
+              rpc.stepIndex ??
+              rpc.step_index;
+            if (typeof idx === "number") {
+              const existingIdx = allSteps.findIndex((s) => {
+                const sIdx =
+                  s.metadata?.sourceTrajectoryStepInfo?.stepIndex ??
+                  s.stepIndex ??
+                  s.step_index;
+                return sIdx === idx;
+              });
+              if (existingIdx !== -1) {
+                // Overwrite with live RPC step for streaming updates
+                allSteps[existingIdx] = rpc;
+              } else {
+                // Append newly running steps not yet on disk
+                allSteps.push(rpc);
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+
+    if (allSteps.length > 0) {
+      allSteps.sort((a, b) => {
+        const ai = a.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? 0;
+        const bi = b.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? 0;
+        return ai - bi;
+      });
+
+      return {
+        trajectory: {
+          trajectoryId: cascadeId,
+          status: trajectoryStatus,
+          steps: allSteps,
+        },
+      };
+    }
 
     return null;
   }
@@ -577,30 +636,19 @@ export class LsClient {
     media: any[],
     modelId: string
   ): Promise<boolean> {
-    const fullItems = [...items];
-    if (Array.isArray(media) && media.length > 0) {
-      for (const m of media) {
-        const rawData = m.inlineData || m.data || m.base64;
-        const mimeType = m.mimeType || "image/png";
-        if (rawData && typeof rawData === "string") {
-          const cleanBase64 = rawData.startsWith("data:") ? rawData.split(",")[1] || rawData : rawData;
-          fullItems.unshift({
-            media: {
-              mimeType,
-              inlineData: cleanBase64,
-              mediaPath: m.mediaPath || m.path || undefined
-            }
-          });
-        }
-      }
-    }
     const payload: any = {
       cascadeId,
-      items: fullItems,
+      items,
       cascadeConfig: buildCascadeConfig(modelId),
       conversationHistoryConfig: { enabled: true },
     };
-    if (media && media.length) payload.media = media;
+    if (Array.isArray(media) && media.length > 0) {
+      payload.media = media.map((m) => ({
+        mimeType: m?.mimeType || "image/png",
+        inlineData: typeof m === "string" ? (m.startsWith("data:") ? m.split(",")[1] : m) : (m?.inlineData?.data || m?.inlineData || m?.data || m?.base64),
+        mediaPath: m?.mediaPath || m?.path || undefined,
+      }));
+    }
     const body = await this.call("SendUserCascadeMessage", payload);
     return body !== null;
   }
@@ -709,7 +757,7 @@ function buildCascadeConfig(modelId: string): any {
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" },
         permissionConfig: { defaultGrants: { ask: ["read_url(*)"] } },
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M16" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true },
     },
@@ -752,12 +800,22 @@ export function extractSteps(trajectoryData: any): TrajectoryStep[] {
   return Array.isArray(steps) ? steps : [];
 }
 
-// The trajectory is "generating" if any recent step is still in the GENERATING
-// / PENDING / RUNNING state (Antigravity uses CORTEX_STEP_STATUS_* values).
-export function isGenerating(steps: TrajectoryStep[]): boolean {
+// The trajectory is "generating" if the overall cascade status is RUNNING/PENDING
+// or any recent step is still in the GENERATING / PENDING / RUNNING state.
+export function isGenerating(steps: TrajectoryStep[], trajectoryStatus?: string): boolean {
+  if (trajectoryStatus) {
+    const s = String(trajectoryStatus).toUpperCase();
+    if (s.includes("RUNNING") || s.includes("PENDING") || s.includes("GENERATING")) {
+      return true;
+    }
+    if (s.includes("DONE") || s.includes("COMPLETED") || s.includes("CANCELLED") || s.includes("ERROR") || s.includes("IDLE")) {
+      return false;
+    }
+  }
+
   if (steps.length === 0) return false;
-  // Scan the tail — the active step isn't always the very last one.
-  const tail = steps.slice(-8);
+  // Scan the tail — check recent 12 steps
+  const tail = steps.slice(-12);
   for (const step of tail) {
     const status = String(step.status ?? "").toUpperCase();
     if (

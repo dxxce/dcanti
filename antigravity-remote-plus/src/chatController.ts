@@ -15,6 +15,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import * as cp from "child_process";
 import {
   LsClient,
   Trajectory,
@@ -46,6 +47,7 @@ export interface ChatMessage {
   // short detail (file name, command, query…) shown after the verb.
   kind?: string;
   detail?: string;
+  images?: string[];
   // For user messages: the trajectory stepIndex, used to revert code back to
   // the checkpoint created at that message (RevertToCascadeStep).
   stepIndex?: number;
@@ -103,6 +105,7 @@ export class ChatController {
   private lastGenerating = false;
   private pollTimer: NodeJS.Timeout | null = null;
   private lastStepSig = "";
+  private lastDiagCheck = 0;
   // Throttle + dedupe the trajectory-list re-emit inside the poll so renames
   // and newly-created conversations appear without a manual refresh.
   private lastTrajRefresh = 0;
@@ -124,6 +127,7 @@ export class ChatController {
   // the poller must NOT auto-jump back to whatever cascade happens to be RUNNING
   // (an older long-running chat). We only auto-resolve when nothing is chosen.
   private userSelected = false;
+  private generatingTimeout: NodeJS.Timeout | null = null;
   // Pending "new chat": startNewConversation doesn't create a trajectory until
   // the first message is sent, so we show an empty transcript and suppress the
   // poller until a brand-new cascade id appears (or the user sends a message).
@@ -152,15 +156,30 @@ export class ChatController {
     return this.cdp.activePort;
   }
 
-  // Capture a screenshot of the IDE workbench window (PNG base64, no data-uri
-  // prefix). Requires the CDP connection; returns null if unavailable.
+  // Capture a screenshot of the Mac desktop screen (PNG base64, no data-uri prefix)
   async captureScreenshot(): Promise<string | null> {
-    if (!this.cdpConnected()) {
-      // Try once to connect (the port may have appeared since startup).
-      this.cdpReady = await this.cdp.connect(this.preferredDebugPort || undefined);
-      if (!this.cdpConnected()) return null;
+    if (process.platform === "darwin") {
+      try {
+        const tmpPath = path.join(os.tmpdir(), `mac_screenshot_${Date.now()}.png`);
+        await new Promise<void>((resolve, reject) => {
+          cp.exec(`screencapture -x -t png "${tmpPath}"`, (err: any) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        if (fs.existsSync(tmpPath)) {
+          const buf = fs.readFileSync(tmpPath);
+          fs.unlinkSync(tmpPath);
+          return buf.toString("base64");
+        }
+      } catch (e: any) {
+        this.log(`[chat] macOS screencapture failed: ${e?.message ?? e}`);
+      }
     }
-    return this.cdp.captureScreenshot();
+    if (this.cdpConnected()) {
+      return this.cdp.captureScreenshot();
+    }
+    return null;
   }
 
   onEvent(cb: (e: ChatEvent) => void): () => void {
@@ -300,32 +319,71 @@ export class ChatController {
     if (!text.trim() && (!images || images.length === 0)) return;
     // Any send counts as an explicit selection, so the poller stays put.
     this.userSelected = true;
-    const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
+    const isNew = this.pendingNewChat;
+    const id = isNew ? "" : (this.activeCascadeId || (await this.resolveActiveCascadeId()));
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M16";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
 
     let sent = false;
 
-    const mediaItems = (images || []).map((b64) => {
-      let mimeType = "image/png";
-      let base64 = b64;
-      const m = b64.match(/^data:(image\/[^;]+);base64,(.+)$/);
-      if (m) {
-        mimeType = m[1];
-        base64 = m[2];
+    const mediaItems: any[] = [];
+    if (images && images.length > 0) {
+      const brainDir = path.join(os.homedir(), ".gemini/antigravity-ide/brain");
+      const targetDir = id ? path.join(brainDir, id, ".user_uploaded") : path.join(brainDir, "temp_uploads");
+      try {
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+      } catch {}
+
+      for (let i = 0; i < images.length; i++) {
+        const b64 = images[i];
+        let mimeType = "image/png";
+        let rawBase64 = b64;
+        const m = b64.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (m) {
+          mimeType = m[1];
+          rawBase64 = m[2];
+        }
+        const ext = mimeType.includes("jpeg") || mimeType.includes("jpg") ? "jpg" : "png";
+        const fileName = `media_${Date.now()}_${i}.${ext}`;
+        const filePath = path.join(targetDir, fileName);
+        try {
+          fs.writeFileSync(filePath, Buffer.from(rawBase64, "base64"));
+        } catch {}
+
+        try {
+          await this.ls.saveMediaAsArtifact(rawBase64, mimeType);
+        } catch {}
+
+        mediaItems.push({
+          mimeType,
+          inlineData: rawBase64,
+          mediaPath: filePath,
+        });
       }
-      return { inlineData: { mimeType, data: base64 } };
-    });
+    }
+
+    // Try focusing/opening the agent panel in the IDE when chatting from web
+    try {
+      await vscode.commands.executeCommand("workbench.action.chat.open");
+    } catch {}
 
     // Prefer direct LS SendUserCascadeMessage with the explicitly chosen model
-    if (id) {
+    if (!isNew && id) {
       try {
         sent = await this.ls.sendUserCascadeMessage(id, text, mediaItems, model);
-        if (sent) this.log(`[chat] sent via LS RPC (model: ${model})`);
+        if (sent) this.log(`[chat] sent via LS RPC (model: ${model}) with ${mediaItems.length} media`);
         else this.log(`[chat] LS RPC send failed; trying CDP/commands`);
       } catch (e: any) {
         this.log(`[chat] LS send error: ${e?.message ?? e}`);
       }
+    } else if (isNew) {
+      // For new chat: try direct RPC with empty cascadeId or commands
+      try {
+        sent = await this.ls.sendUserCascadeMessage("", text, mediaItems, model);
+        if (sent) this.log(`[chat] new chat sent via LS RPC`);
+      } catch {}
     }
 
     if (!sent && this.cdpConnected()) {
@@ -360,7 +418,12 @@ export class ChatController {
       await this.adoptNewCascadeIfPending();
     } else {
       this.lastStepSig = "";
-      await this.pushFullState();
+      this.lastGenerating = true;
+      this.lastStatusText = "Thinking";
+      const id = this.activeCascadeId;
+      if (id) {
+        this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
+      }
     }
   }
 
@@ -395,7 +458,9 @@ export class ChatController {
       await this.adoptNewCascadeIfPending();
     } else {
       this.lastStepSig = "";
-      await this.pushFullState();
+      this.lastGenerating = true;
+      this.lastStatusText = "Thinking";
+      this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
     }
   }
 
@@ -477,6 +542,18 @@ export class ChatController {
   async cancel(): Promise<boolean> {
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
     if (!id) return false;
+    if (this.generatingTimeout) {
+      clearTimeout(this.generatingTimeout);
+      this.generatingTimeout = null;
+    }
+    this.lastGenerating = false;
+    this.lastStatusText = "Idle";
+    this.emit({ type: "status", cascadeId: id, generating: false, statusText: "Idle" });
+
+    try {
+      await vscode.commands.executeCommand("antigravity.cancelChat");
+    } catch {}
+
     return this.ls.cancel(id);
   }
 
@@ -491,6 +568,7 @@ export class ChatController {
     await delay(150);
     const model = this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.revertToStep(id, stepIndex, model);
+    await delay(300);
     this.lastStepSig = "";
     await this.pushFullState();
     this.log(`[chat] revert to step ${stepIndex} -> ${ok ? "ok" : "failed"}`);
@@ -625,7 +703,7 @@ export class ChatController {
       ).filter(Boolean) ??
       [];
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M16";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
     return this.ls.getSlashCommands(id, uris, model);
   }
 
@@ -638,7 +716,7 @@ export class ChatController {
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
     if (!id) return false;
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M16";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.approveArtifact(id, artifactUri, approved, model);
     this.lastStepSig = "";
     await this.pushFullState();
@@ -703,11 +781,31 @@ export class ChatController {
     const status = await this.ls.getUserStatus();
     const us = status?.userStatus ?? status;
     const configs = us?.cascadeModelConfigData?.clientModelConfigs;
-    // Which model to mark selected: the user's explicit pick if any, otherwise
-    // the model the active conversation is actually running (from the latest
-    // planner step's requestedModel), otherwise the recommended default.
     const activeModel = await this.detectActiveModel();
+
     if (Array.isArray(configs) && configs.length > 0) {
+      // Find if selectedModelId exists in configs
+      const hasSelected = configs.some((c: any) => {
+        const mid = String(c?.modelOrAlias?.model ?? "");
+        const alias = String(c?.modelOrAlias?.alias ?? "");
+        const label = String(c?.label ?? "");
+        return this.selectedModelId && (this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label);
+      });
+
+      if (!this.selectedModelId || !hasSelected) {
+        // Default to Gemini 3.7 Flash High (M36)
+        const m36 = configs.find((c: any) => {
+          const mid = String(c?.modelOrAlias?.model ?? "");
+          const label = String(c?.label ?? "").toLowerCase();
+          return mid === "MODEL_PLACEHOLDER_M36" || (label.includes("3.7") && label.includes("flash"));
+        });
+        if (m36) {
+          this.selectedModelId = String(m36?.modelOrAlias?.model ?? m36?.modelOrAlias?.alias ?? m36?.label ?? "MODEL_PLACEHOLDER_M36");
+        } else {
+          this.selectedModelId = "MODEL_PLACEHOLDER_M36";
+        }
+      }
+
       return configs.map((c: any) => {
         const mid = String(c?.modelOrAlias?.model ?? "");
         const alias = String(c?.modelOrAlias?.alias ?? "");
@@ -720,7 +818,7 @@ export class ChatController {
             this.selectedModelId === label
           : activeModel
           ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id
-          : Boolean(c?.isRecommended);
+          : mid === "MODEL_PLACEHOLDER_M36" || Boolean(c?.isRecommended);
         return {
           id,
           label: label || mid || alias,
@@ -824,8 +922,9 @@ export class ChatController {
     const id = cascadeId || this.activeCascadeId || (await this.resolveActiveCascadeId());
     const data = id ? await this.ls.getTrajectory(id) : null;
     const steps = extractSteps(data);
-    const generating = isGenerating(steps);
-    const statusText = describeStatus(steps);
+    const trajectoryStatus = data?.trajectory?.status ?? data?.status;
+    const generating = isGenerating(steps, trajectoryStatus);
+    const statusText = describeStatus(steps, generating);
     const messages = stepsToMessages(steps, id || undefined);
     if (id) accumulateStatsFromSteps(id, steps, (s) => this.emit({ type: "stats_update", stats: s }));
     return { cascadeId: id, generating, statusText, messages };
@@ -858,64 +957,128 @@ export class ChatController {
     // While a new chat is pending (no message sent yet), keep the transcript
     // empty and don't snap to any existing cascade.
     if (this.pendingNewChat) return;
+
+    // Periodically check if IDE active chat changed (e.g., user started typing in IDE)
+    if (now - this.lastDiagCheck > 1000) {
+      this.lastDiagCheck = now;
+      let ideId = "";
+      try {
+        const diag: any = await vscode.commands.executeCommand("antigravity.getDiagnostics");
+        ideId = String(
+          diag?.recentTrajectories?.[0]?.googleAgentId ??
+          diag?.recentTrajectories?.[0]?.cascadeId ??
+          ""
+        );
+      } catch {}
+
+      if (!ideId && !this.userSelected) {
+        try {
+          const list = await this.ls.getAllTrajectories();
+          const folders = vscode.workspace.workspaceFolders;
+          const curWsUri = folders?.[0]?.uri?.toString();
+          const normCur = curWsUri ? decodeURIComponent(curWsUri.replace(/\/+$/, "")).toLowerCase() : "";
+          let targetList = list;
+          if (normCur) {
+            const filtered = list.filter((t) => {
+              if (!t.workspaceUri) return false;
+              const normT = decodeURIComponent(t.workspaceUri.replace(/\/+$/, "")).toLowerCase();
+              return normT === normCur || normCur.includes(normT) || normT.includes(normCur);
+            });
+            if (filtered.length > 0) targetList = filtered;
+          }
+
+          const running = targetList.find((t) => String(t.status ?? "").toUpperCase().includes("RUNNING"));
+          if (running) ideId = running.id;
+          else if (targetList.length > 0) ideId = targetList[0].id;
+        } catch {}
+      }
+
+      if (ideId && ideId !== this.activeCascadeId) {
+        this.activeCascadeId = ideId;
+        this.userSelected = false;
+        this.lastStepSig = "";
+      }
+    }
+
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
     if (!id) return;
     const data = await this.ls.getTrajectory(id);
     if (!data) return;
     const steps = extractSteps(data);
-    const messages = stepsToMessages(steps);
-    const generating = isGenerating(steps);
-    const statusText = describeStatus(steps);
+    const trajectoryStatus = data?.trajectory?.status ?? data?.status;
+    const messages = stepsToMessages(steps, id || undefined);
+    const generating = isGenerating(steps, trajectoryStatus);
+    const statusText = describeStatus(steps, generating);
 
     accumulateStatsFromSteps(id, steps, (s) => this.emit({ type: "stats_update", stats: s }));
 
-    // Signature over the rendered messages so we only push on real changes
-    // (message count + last message length catches streaming updates).
+    // Debounce generating = false to prevent Stop button flickering between rapid step transitions
+    let effectiveGenerating = generating;
+    if (generating) {
+      if (this.generatingTimeout) {
+        clearTimeout(this.generatingTimeout);
+        this.generatingTimeout = null;
+      }
+    } else if (this.lastGenerating === true && !this.generatingTimeout) {
+      // Agent just stopped generating. Wait 500ms to confirm reply is truly finished!
+      effectiveGenerating = true; // keep it true for 500ms
+      this.generatingTimeout = setTimeout(() => {
+        this.generatingTimeout = null;
+        if (this.lastGenerating === true) {
+          this.lastGenerating = false;
+          this.lastStatusText = "Idle";
+          this.emit({ type: "status", cascadeId: id, generating: false, statusText: "Idle" });
+          // Fire models/quota update ONLY when truly done
+          this.getModels().then(m => m && m.length > 0 && this.emit({ type: "models", models: m })).catch(()=>{});
+          this.getQuota().then(q => q && this.emit({ type: "quota", quota: q })).catch(()=>{});
+        }
+      }, 500);
+    } else if (this.generatingTimeout) {
+      effectiveGenerating = true; // still in debounce period
+    }
+
+    // Signature over the rendered messages and steps
     const last = messages[messages.length - 1];
-    const sig =
-      `${generating}|${messages.length}|` +
-      `${last ? `${last.role}:${last.text.length}` : ""}`;
+    const lastSig = last ? `${last.role}:${last.text.length}:${last.detail ? last.detail.length : 0}` : "";
+    const sig = `${effectiveGenerating}|${statusText}|${steps.length}|${messages.length}|${lastSig}`;
 
     if (sig !== this.lastStepSig) {
-      const oldSigParts = this.lastStepSig.split("|");
-      const newSigParts = sig.split("|");
+      const prevParts = this.lastStepSig.split("|");
+      const curParts = sig.split("|");
       
-      if (
+      const canUpdate =
         this.lastStepSig &&
-        oldSigParts[0] === newSigParts[0] &&
-        oldSigParts[1] === newSigParts[1] &&
-        last &&
-        oldSigParts[2] &&
-        last.role === oldSigParts[2].split(":")[0]
-      ) {
-        this.lastStepSig = sig;
-        this.emit({ type: "state_update", cascadeId: id, generating, statusText, lastMessage: last });
+        prevParts.length === 5 &&
+        curParts.length === 5 &&
+        prevParts[2] === curParts[2] && // steps.length unchanged
+        prevParts[3] === curParts[3];   // messages.length unchanged
+
+      this.lastStepSig = sig;
+
+      if (canUpdate && last) {
+        this.emit({
+          type: "state_update",
+          cascadeId: id,
+          generating: effectiveGenerating,
+          statusText,
+          lastMessage: last,
+        });
       } else {
-        this.lastStepSig = sig;
         this.emit({
           type: "state",
-          state: { cascadeId: id, generating, statusText, messages },
+          state: { cascadeId: id, generating: effectiveGenerating, statusText, messages },
         });
       }
     }
-    if (generating !== this.lastGenerating || statusText !== this.lastStatusText) {
-      const wasGenerating = this.lastGenerating;
-      this.lastGenerating = generating;
-      this.lastStatusText = statusText;
-      this.emit({ type: "status", cascadeId: id, generating, statusText });
 
-      // When the agent reply ends (transition from generating to not generating)
-      if (wasGenerating && !generating) {
-        this.getModels()
-          .then((models) => {
-            if (models && models.length > 0) this.emit({ type: "models", models });
-          })
-          .catch(() => {});
-        this.getQuota()
-          .then((quota) => {
-            if (quota) this.emit({ type: "quota", quota });
-          })
-          .catch(() => {});
+    if (effectiveGenerating !== this.lastGenerating || statusText !== this.lastStatusText) {
+      if (!this.generatingTimeout) {
+        this.lastGenerating = effectiveGenerating;
+        this.lastStatusText = statusText;
+        this.emit({ type: "status", cascadeId: id, generating: effectiveGenerating, statusText });
+      } else if (statusText !== this.lastStatusText) {
+        this.lastStatusText = statusText;
+        this.emit({ type: "status", cascadeId: id, generating: true, statusText });
       }
     }
   }
@@ -1024,11 +1187,18 @@ function toolInfo(step: any): { kind: string; verb: string; detail: string } {
   }
 }
 
-function describeStatus(steps: TrajectoryStep[]): string {
-  if (steps.length === 0) return "Idle";
+function describeStatus(steps: TrajectoryStep[], generating?: boolean): string {
+  if (!generating || steps.length === 0) return "Idle";
   const last = steps[steps.length - 1] as any;
   const type = shortType(last.type);
-  if (type === "PLANNER_RESPONSE") return "Thinking";
+  if (type === "PLANNER_RESPONSE") {
+    const status = String(last.status ?? "").toUpperCase();
+    if (status.includes("RUNNING") || status.includes("PENDING") || status.includes("GENERATING")) {
+      return "Thinking";
+    }
+    return "Idle";
+  }
+  if (type === "USER_INPUT") return "Thinking";
   const info = toolInfo(last);
   return info.detail ? `${info.verb} ${info.detail}` : info.verb;
 }
@@ -1169,11 +1339,37 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
           ""
       ).trim();
 
+      const images: string[] = [];
+      if (Array.isArray(step.userInput?.items)) {
+        for (const it of step.userInput.items) {
+          const m = it?.media;
+          if (m) {
+            const mime = m.mimeType || "image/png";
+            const data = m.inlineData || m.data;
+            if (data && typeof data === "string") {
+              const src = data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
+              images.push(src);
+            }
+          }
+        }
+      }
+      if (Array.isArray(step.userInput?.media)) {
+        for (const m of step.userInput.media) {
+          const mime = m?.mimeType || "image/png";
+          const data = m?.inlineData || m?.data;
+          if (data && typeof data === "string") {
+            const src = data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
+            images.push(src);
+          }
+        }
+      }
+
       const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex;
-      if (t)
+      if (t || images.length > 0)
         msgs.push({
           role: "user",
           text: t,
+          images: images.length > 0 ? images : undefined,
           stepIndex: typeof stepIndex === "number" ? stepIndex : undefined,
         });
       continue;

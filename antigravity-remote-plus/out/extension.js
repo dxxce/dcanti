@@ -3979,6 +3979,8 @@ var LsClient = class {
   }) {
     this.conn = null;
     this.discovering = null;
+    this.stepCache = /* @__PURE__ */ new Map();
+    this.transcriptCache = /* @__PURE__ */ new Map();
     this.log = log2;
   }
   async discover() {
@@ -3996,9 +3998,11 @@ var LsClient = class {
       const conn = await probePort(port, proc.csrfToken);
       if (conn) {
         conn.pid = proc.pid;
-        this.log(
-          `[LS] connected: pid=${proc.pid} port=${port} tls=${conn.useTls}`
-        );
+        if (!this.conn || this.conn.pid !== proc.pid || this.conn.port !== port) {
+          this.log(
+            `[LS] connected: pid=${proc.pid} port=${port} tls=${conn.useTls}`
+          );
+        }
         return conn;
       }
     }
@@ -4154,81 +4158,120 @@ var LsClient = class {
     return list;
   }
   async getTrajectory(cascadeId) {
-    try {
-      const body = await this.call("GetCascadeTrajectory", { cascadeId });
-      if (body) {
-        const parsed = JSON.parse(body);
-        if (parsed?.trajectory?.steps && parsed.trajectory.steps.length > 0) {
-          return parsed;
-        }
-      }
-    } catch {
-    }
+    let allSteps = [];
     try {
       const brainDir = path.join(os.homedir(), ".gemini", "antigravity-ide", "brain");
       const transcriptPath = path.join(brainDir, cascadeId, ".system_generated", "logs", "transcript.jsonl");
       if (fs.existsSync(transcriptPath)) {
-        const raw = fs.readFileSync(transcriptPath, "utf8");
-        const lines = raw.split("\n");
-        const steps = [];
-        for (const line of lines) {
-          if (!line.trim())
-            continue;
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.type === "USER_INPUT") {
-              let userText = parsed.content || "";
-              const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
-              if (req)
-                userText = req[1];
-              steps.push({
-                type: "CORTEX_STEP_TYPE_USER_INPUT",
-                status: "CORTEX_STEP_STATUS_DONE",
-                userInput: { userResponse: userText },
-                metadata: {
-                  sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? steps.length },
-                  createdAt: parsed.created_at
-                }
-              });
-            } else if (parsed.type === "PLANNER_RESPONSE") {
-              steps.push({
-                type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
-                status: "CORTEX_STEP_STATUS_DONE",
-                plannerResponse: {
-                  response: parsed.content || "",
-                  toolCalls: parsed.tool_calls
-                },
-                metadata: {
-                  createdAt: parsed.created_at
-                }
-              });
-            } else if (parsed.type === "TOOL_CALL" || parsed.tool_calls) {
-              const tc = parsed.tool_calls?.[0];
-              steps.push({
-                type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
-                status: "CORTEX_STEP_STATUS_DONE",
-                content: parsed.content,
-                metadata: {
-                  toolAction: tc?.name,
-                  toolSummary: tc?.toolSummary,
-                  toolCall: { argumentsJson: JSON.stringify(tc?.parameters || {}) },
-                  createdAt: parsed.created_at
-                }
-              });
+        const stat = fs.statSync(transcriptPath);
+        const cached = this.transcriptCache.get(cascadeId);
+        if (cached && cached.mtime === stat.mtimeMs) {
+          allSteps = [...cached.steps];
+        } else {
+          const raw = fs.readFileSync(transcriptPath, "utf8");
+          const lines = raw.split("\n");
+          let lastPlannerToolCalls = null;
+          const parsedSteps = [];
+          for (const line of lines) {
+            if (!line.trim())
+              continue;
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.type === "USER_INPUT") {
+                let userText = parsed.content || "";
+                const req = userText.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+                if (req)
+                  userText = req[1];
+                parsedSteps.push({
+                  type: "CORTEX_STEP_TYPE_USER_INPUT",
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  userInput: { userResponse: userText },
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    createdAt: parsed.created_at
+                  }
+                });
+              } else if (parsed.type === "PLANNER_RESPONSE") {
+                lastPlannerToolCalls = parsed.tool_calls;
+                parsedSteps.push({
+                  type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  plannerResponse: {
+                    response: parsed.content || "",
+                    toolCalls: parsed.tool_calls
+                  },
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    createdAt: parsed.created_at
+                  }
+                });
+              } else if (parsed.type !== "CHECKPOINT" && parsed.type !== "CONVERSATION_HISTORY" && parsed.type !== "SYSTEM_MESSAGE" && parsed.type !== "EPHEMERAL_MESSAGE") {
+                const tc = parsed.tool_calls?.[0] || lastPlannerToolCalls?.[0];
+                parsedSteps.push({
+                  type: `CORTEX_STEP_TYPE_${tc?.name ? tc.name.toUpperCase() : "TOOL"}`,
+                  status: "CORTEX_STEP_STATUS_DONE",
+                  content: parsed.content,
+                  metadata: {
+                    sourceTrajectoryStepInfo: { stepIndex: parsed.step_index ?? parsedSteps.length },
+                    toolAction: tc?.name || parsed.type,
+                    toolSummary: tc?.toolSummary || tc?.args?.toolSummary?.replace(/"/g, ""),
+                    toolCall: { argumentsJson: JSON.stringify(tc?.parameters || tc?.args || tc?.arguments || {}) },
+                    createdAt: parsed.created_at
+                  }
+                });
+                lastPlannerToolCalls = null;
+              }
+            } catch {
             }
-          } catch {
           }
-        }
-        if (steps.length > 0) {
-          return {
-            trajectory: {
-              trajectoryId: cascadeId,
-              steps
-            }
-          };
+          this.transcriptCache.set(cascadeId, { mtime: stat.mtimeMs, steps: parsedSteps });
+          allSteps = [...parsedSteps];
         }
       }
     } catch {
+    }
+    let trajectoryStatus;
+    try {
+      const body = await this.call("GetCascadeTrajectory", { cascadeId });
+      if (body) {
+        const parsed = JSON.parse(body);
+        trajectoryStatus = parsed?.trajectory?.status ?? parsed?.status;
+        const rpcSteps = parsed?.trajectory?.steps || [];
+        if (Array.isArray(rpcSteps) && rpcSteps.length > 0) {
+          if (allSteps.length === 0) {
+            return parsed;
+          }
+          for (const rpc of rpcSteps) {
+            const idx = rpc.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? rpc.stepIndex ?? rpc.step_index;
+            if (typeof idx === "number") {
+              const existingIdx = allSteps.findIndex((s) => {
+                const sIdx = s.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? s.stepIndex ?? s.step_index;
+                return sIdx === idx;
+              });
+              if (existingIdx !== -1) {
+                allSteps[existingIdx] = rpc;
+              } else {
+                allSteps.push(rpc);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+    }
+    if (allSteps.length > 0) {
+      allSteps.sort((a, b) => {
+        const ai = a.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? 0;
+        const bi = b.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? 0;
+        return ai - bi;
+      });
+      return {
+        trajectory: {
+          trajectoryId: cascadeId,
+          status: trajectoryStatus,
+          steps: allSteps
+        }
+      };
     }
     return null;
   }
@@ -4270,31 +4313,19 @@ var LsClient = class {
   // command ({item:{slashCommand:{info:{…}}}}) or a conversation mention
   // ({item:{conversation:{id,title,lastModifiedTime}}}) alongside text items.
   async sendCascadeItems(cascadeId, items, media, modelId) {
-    const fullItems = [...items];
-    if (Array.isArray(media) && media.length > 0) {
-      for (const m of media) {
-        const rawData = m.inlineData || m.data || m.base64;
-        const mimeType = m.mimeType || "image/png";
-        if (rawData && typeof rawData === "string") {
-          const cleanBase64 = rawData.startsWith("data:") ? rawData.split(",")[1] || rawData : rawData;
-          fullItems.unshift({
-            media: {
-              mimeType,
-              inlineData: cleanBase64,
-              mediaPath: m.mediaPath || m.path || void 0
-            }
-          });
-        }
-      }
-    }
     const payload = {
       cascadeId,
-      items: fullItems,
+      items,
       cascadeConfig: buildCascadeConfig(modelId),
       conversationHistoryConfig: { enabled: true }
     };
-    if (media && media.length)
-      payload.media = media;
+    if (Array.isArray(media) && media.length > 0) {
+      payload.media = media.map((m) => ({
+        mimeType: m?.mimeType || "image/png",
+        inlineData: typeof m === "string" ? m.startsWith("data:") ? m.split(",")[1] : m : m?.inlineData?.data || m?.inlineData || m?.data || m?.base64,
+        mediaPath: m?.mediaPath || m?.path || void 0
+      }));
+    }
     const body = await this.call("SendUserCascadeMessage", payload);
     return body !== null;
   }
@@ -4375,7 +4406,7 @@ function buildCascadeConfig(modelId) {
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" },
         permissionConfig: { defaultGrants: { ask: ["read_url(*)"] } }
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M16" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true }
     },
@@ -4408,10 +4439,19 @@ function extractSteps(trajectoryData) {
   const steps = trajectoryData?.trajectory?.steps ?? trajectoryData?.steps ?? [];
   return Array.isArray(steps) ? steps : [];
 }
-function isGenerating(steps) {
+function isGenerating(steps, trajectoryStatus) {
+  if (trajectoryStatus) {
+    const s = String(trajectoryStatus).toUpperCase();
+    if (s.includes("RUNNING") || s.includes("PENDING") || s.includes("GENERATING")) {
+      return true;
+    }
+    if (s.includes("DONE") || s.includes("COMPLETED") || s.includes("CANCELLED") || s.includes("ERROR") || s.includes("IDLE")) {
+      return false;
+    }
+  }
   if (steps.length === 0)
     return false;
-  const tail = steps.slice(-8);
+  const tail = steps.slice(-12);
   for (const step of tail) {
     const status = String(step.status ?? "").toUpperCase();
     if (status.includes("GENERATING") || status.includes("PENDING") || status.includes("RUNNING")) {
@@ -4426,6 +4466,7 @@ var vscode = __toESM(require("vscode"));
 var fs2 = __toESM(require("fs"));
 var os2 = __toESM(require("os"));
 var path2 = __toESM(require("path"));
+var cp = __toESM(require("child_process"));
 
 // src/cdpClient.ts
 var http2 = __toESM(require("http"));
@@ -4865,6 +4906,7 @@ var ChatController = class {
     this.lastGenerating = false;
     this.pollTimer = null;
     this.lastStepSig = "";
+    this.lastDiagCheck = 0;
     // Throttle + dedupe the trajectory-list re-emit inside the poll so renames
     // and newly-created conversations appear without a manual refresh.
     this.lastTrajRefresh = 0;
@@ -4883,6 +4925,7 @@ var ChatController = class {
     // the poller must NOT auto-jump back to whatever cascade happens to be RUNNING
     // (an older long-running chat). We only auto-resolve when nothing is chosen.
     this.userSelected = false;
+    this.generatingTimeout = null;
     // Pending "new chat": startNewConversation doesn't create a trajectory until
     // the first message is sent, so we show an empty transcript and suppress the
     // poller until a brand-new cascade id appears (or the user sends a message).
@@ -4906,15 +4949,32 @@ var ChatController = class {
   cdpPort() {
     return this.cdp.activePort;
   }
-  // Capture a screenshot of the IDE workbench window (PNG base64, no data-uri
-  // prefix). Requires the CDP connection; returns null if unavailable.
+  // Capture a screenshot of the Mac desktop screen (PNG base64, no data-uri prefix)
   async captureScreenshot() {
-    if (!this.cdpConnected()) {
-      this.cdpReady = await this.cdp.connect(this.preferredDebugPort || void 0);
-      if (!this.cdpConnected())
-        return null;
+    if (process.platform === "darwin") {
+      try {
+        const tmpPath = path2.join(os2.tmpdir(), `mac_screenshot_${Date.now()}.png`);
+        await new Promise((resolve3, reject) => {
+          cp.exec(`screencapture -x -t png "${tmpPath}"`, (err) => {
+            if (err)
+              reject(err);
+            else
+              resolve3();
+          });
+        });
+        if (fs2.existsSync(tmpPath)) {
+          const buf = fs2.readFileSync(tmpPath);
+          fs2.unlinkSync(tmpPath);
+          return buf.toString("base64");
+        }
+      } catch (e) {
+        this.log(`[chat] macOS screencapture failed: ${e?.message ?? e}`);
+      }
     }
-    return this.cdp.captureScreenshot();
+    if (this.cdpConnected()) {
+      return this.cdp.captureScreenshot();
+    }
+    return null;
   }
   onEvent(cb) {
     this.listeners.add(cb);
@@ -5027,28 +5087,67 @@ var ChatController = class {
     if (!text.trim() && (!images || images.length === 0))
       return;
     this.userSelected = true;
-    const id = this.activeCascadeId || await this.resolveActiveCascadeId();
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M16";
+    const isNew = this.pendingNewChat;
+    const id = isNew ? "" : this.activeCascadeId || await this.resolveActiveCascadeId();
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
     let sent = false;
-    const mediaItems = (images || []).map((b64) => {
-      let mimeType = "image/png";
-      let base64 = b64;
-      const m = b64.match(/^data:(image\/[^;]+);base64,(.+)$/);
-      if (m) {
-        mimeType = m[1];
-        base64 = m[2];
+    const mediaItems = [];
+    if (images && images.length > 0) {
+      const brainDir = path2.join(os2.homedir(), ".gemini/antigravity-ide/brain");
+      const targetDir = id ? path2.join(brainDir, id, ".user_uploaded") : path2.join(brainDir, "temp_uploads");
+      try {
+        if (!fs2.existsSync(targetDir)) {
+          fs2.mkdirSync(targetDir, { recursive: true });
+        }
+      } catch {
       }
-      return { inlineData: { mimeType, data: base64 } };
-    });
-    if (id) {
+      for (let i = 0; i < images.length; i++) {
+        const b64 = images[i];
+        let mimeType = "image/png";
+        let rawBase64 = b64;
+        const m = b64.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (m) {
+          mimeType = m[1];
+          rawBase64 = m[2];
+        }
+        const ext = mimeType.includes("jpeg") || mimeType.includes("jpg") ? "jpg" : "png";
+        const fileName = `media_${Date.now()}_${i}.${ext}`;
+        const filePath = path2.join(targetDir, fileName);
+        try {
+          fs2.writeFileSync(filePath, Buffer.from(rawBase64, "base64"));
+        } catch {
+        }
+        try {
+          await this.ls.saveMediaAsArtifact(rawBase64, mimeType);
+        } catch {
+        }
+        mediaItems.push({
+          mimeType,
+          inlineData: rawBase64,
+          mediaPath: filePath
+        });
+      }
+    }
+    try {
+      await vscode.commands.executeCommand("workbench.action.chat.open");
+    } catch {
+    }
+    if (!isNew && id) {
       try {
         sent = await this.ls.sendUserCascadeMessage(id, text, mediaItems, model);
         if (sent)
-          this.log(`[chat] sent via LS RPC (model: ${model})`);
+          this.log(`[chat] sent via LS RPC (model: ${model}) with ${mediaItems.length} media`);
         else
           this.log(`[chat] LS RPC send failed; trying CDP/commands`);
       } catch (e) {
         this.log(`[chat] LS send error: ${e?.message ?? e}`);
+      }
+    } else if (isNew) {
+      try {
+        sent = await this.ls.sendUserCascadeMessage("", text, mediaItems, model);
+        if (sent)
+          this.log(`[chat] new chat sent via LS RPC`);
+      } catch {
       }
     }
     if (!sent && this.cdpConnected()) {
@@ -5082,7 +5181,12 @@ var ChatController = class {
       await this.adoptNewCascadeIfPending();
     } else {
       this.lastStepSig = "";
-      await this.pushFullState();
+      this.lastGenerating = true;
+      this.lastStatusText = "Thinking";
+      const id2 = this.activeCascadeId;
+      if (id2) {
+        this.emit({ type: "status", cascadeId: id2, generating: true, statusText: "Thinking" });
+      }
     }
   }
   // Note: Media sending has been removed per user request.
@@ -5111,7 +5215,9 @@ var ChatController = class {
       await this.adoptNewCascadeIfPending();
     } else {
       this.lastStepSig = "";
-      await this.pushFullState();
+      this.lastGenerating = true;
+      this.lastStatusText = "Thinking";
+      this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
     }
   }
   // Invoke a system slash command (grill-me / goal / schedule / learn …). The
@@ -5182,6 +5288,17 @@ var ChatController = class {
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
       return false;
+    if (this.generatingTimeout) {
+      clearTimeout(this.generatingTimeout);
+      this.generatingTimeout = null;
+    }
+    this.lastGenerating = false;
+    this.lastStatusText = "Idle";
+    this.emit({ type: "status", cascadeId: id, generating: false, statusText: "Idle" });
+    try {
+      await vscode.commands.executeCommand("antigravity.cancelChat");
+    } catch {
+    }
     return this.ls.cancel(id);
   }
   // Real revert: Antigravity's RevertToCascadeStep RPC rolls the workspace code
@@ -5196,6 +5313,7 @@ var ChatController = class {
     await delay(150);
     const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.revertToStep(id, stepIndex, model);
+    await delay(300);
     this.lastStepSig = "";
     await this.pushFullState();
     this.log(`[chat] revert to step ${stepIndex} -> ${ok ? "ok" : "failed"}`);
@@ -5311,7 +5429,7 @@ var ChatController = class {
     const uris = data?.trajectory?.metadata?.workspaceUris ?? data?.trajectory?.metadata?.workspaces?.map(
       (w) => w?.workspaceFolderAbsoluteUri
     ).filter(Boolean) ?? [];
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M16";
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
     return this.ls.getSlashCommands(id, uris, model);
   }
   // Approve or reject a plan artifact (implementation_plan.md etc). The IDE
@@ -5320,7 +5438,7 @@ var ChatController = class {
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
       return false;
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M16";
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.approveArtifact(id, artifactUri, approved, model);
     this.lastStepSig = "";
     await this.pushFullState();
@@ -5373,12 +5491,30 @@ var ChatController = class {
     const configs = us?.cascadeModelConfigData?.clientModelConfigs;
     const activeModel = await this.detectActiveModel();
     if (Array.isArray(configs) && configs.length > 0) {
+      const hasSelected = configs.some((c) => {
+        const mid = String(c?.modelOrAlias?.model ?? "");
+        const alias = String(c?.modelOrAlias?.alias ?? "");
+        const label = String(c?.label ?? "");
+        return this.selectedModelId && (this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label);
+      });
+      if (!this.selectedModelId || !hasSelected) {
+        const m36 = configs.find((c) => {
+          const mid = String(c?.modelOrAlias?.model ?? "");
+          const label = String(c?.label ?? "").toLowerCase();
+          return mid === "MODEL_PLACEHOLDER_M36" || label.includes("3.7") && label.includes("flash");
+        });
+        if (m36) {
+          this.selectedModelId = String(m36?.modelOrAlias?.model ?? m36?.modelOrAlias?.alias ?? m36?.label ?? "MODEL_PLACEHOLDER_M36");
+        } else {
+          this.selectedModelId = "MODEL_PLACEHOLDER_M36";
+        }
+      }
       return configs.map((c) => {
         const mid = String(c?.modelOrAlias?.model ?? "");
         const alias = String(c?.modelOrAlias?.alias ?? "");
         const label = String(c?.label ?? "");
         const id = mid || alias || label;
-        const isSel = this.selectedModelId ? this.selectedModelId === id || this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label : activeModel ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id : Boolean(c?.isRecommended);
+        const isSel = this.selectedModelId ? this.selectedModelId === id || this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label : activeModel ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id : mid === "MODEL_PLACEHOLDER_M36" || Boolean(c?.isRecommended);
         return {
           id,
           label: label || mid || alias,
@@ -5462,8 +5598,9 @@ var ChatController = class {
     const id = cascadeId || this.activeCascadeId || await this.resolveActiveCascadeId();
     const data = id ? await this.ls.getTrajectory(id) : null;
     const steps = extractSteps(data);
-    const generating = isGenerating(steps);
-    const statusText = describeStatus(steps);
+    const trajectoryStatus = data?.trajectory?.status ?? data?.status;
+    const generating = isGenerating(steps, trajectoryStatus);
+    const statusText = describeStatus(steps, generating);
     const messages = stepsToMessages(steps, id || void 0);
     if (id)
       accumulateStatsFromSteps(id, steps, (s) => this.emit({ type: "stats_update", stats: s }));
@@ -5488,6 +5625,47 @@ var ChatController = class {
     }
     if (this.pendingNewChat)
       return;
+    if (now - this.lastDiagCheck > 1e3) {
+      this.lastDiagCheck = now;
+      let ideId = "";
+      try {
+        const diag = await vscode.commands.executeCommand("antigravity.getDiagnostics");
+        ideId = String(
+          diag?.recentTrajectories?.[0]?.googleAgentId ?? diag?.recentTrajectories?.[0]?.cascadeId ?? ""
+        );
+      } catch {
+      }
+      if (!ideId && !this.userSelected) {
+        try {
+          const list = await this.ls.getAllTrajectories();
+          const folders = vscode.workspace.workspaceFolders;
+          const curWsUri = folders?.[0]?.uri?.toString();
+          const normCur = curWsUri ? decodeURIComponent(curWsUri.replace(/\/+$/, "")).toLowerCase() : "";
+          let targetList = list;
+          if (normCur) {
+            const filtered = list.filter((t) => {
+              if (!t.workspaceUri)
+                return false;
+              const normT = decodeURIComponent(t.workspaceUri.replace(/\/+$/, "")).toLowerCase();
+              return normT === normCur || normCur.includes(normT) || normT.includes(normCur);
+            });
+            if (filtered.length > 0)
+              targetList = filtered;
+          }
+          const running2 = targetList.find((t) => String(t.status ?? "").toUpperCase().includes("RUNNING"));
+          if (running2)
+            ideId = running2.id;
+          else if (targetList.length > 0)
+            ideId = targetList[0].id;
+        } catch {
+        }
+      }
+      if (ideId && ideId !== this.activeCascadeId) {
+        this.activeCascadeId = ideId;
+        this.userSelected = false;
+        this.lastStepSig = "";
+      }
+    }
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
       return;
@@ -5495,42 +5673,66 @@ var ChatController = class {
     if (!data)
       return;
     const steps = extractSteps(data);
-    const messages = stepsToMessages(steps);
-    const generating = isGenerating(steps);
-    const statusText = describeStatus(steps);
+    const trajectoryStatus = data?.trajectory?.status ?? data?.status;
+    const messages = stepsToMessages(steps, id || void 0);
+    const generating = isGenerating(steps, trajectoryStatus);
+    const statusText = describeStatus(steps, generating);
     accumulateStatsFromSteps(id, steps, (s) => this.emit({ type: "stats_update", stats: s }));
+    let effectiveGenerating = generating;
+    if (generating) {
+      if (this.generatingTimeout) {
+        clearTimeout(this.generatingTimeout);
+        this.generatingTimeout = null;
+      }
+    } else if (this.lastGenerating === true && !this.generatingTimeout) {
+      effectiveGenerating = true;
+      this.generatingTimeout = setTimeout(() => {
+        this.generatingTimeout = null;
+        if (this.lastGenerating === true) {
+          this.lastGenerating = false;
+          this.lastStatusText = "Idle";
+          this.emit({ type: "status", cascadeId: id, generating: false, statusText: "Idle" });
+          this.getModels().then((m) => m && m.length > 0 && this.emit({ type: "models", models: m })).catch(() => {
+          });
+          this.getQuota().then((q) => q && this.emit({ type: "quota", quota: q })).catch(() => {
+          });
+        }
+      }, 500);
+    } else if (this.generatingTimeout) {
+      effectiveGenerating = true;
+    }
     const last = messages[messages.length - 1];
-    const sig = `${generating}|${messages.length}|${last ? `${last.role}:${last.text.length}` : ""}`;
+    const lastSig = last ? `${last.role}:${last.text.length}:${last.detail ? last.detail.length : 0}` : "";
+    const sig = `${effectiveGenerating}|${statusText}|${steps.length}|${messages.length}|${lastSig}`;
     if (sig !== this.lastStepSig) {
-      const oldSigParts = this.lastStepSig.split("|");
-      const newSigParts = sig.split("|");
-      if (this.lastStepSig && oldSigParts[0] === newSigParts[0] && oldSigParts[1] === newSigParts[1] && last && oldSigParts[2] && last.role === oldSigParts[2].split(":")[0]) {
-        this.lastStepSig = sig;
-        this.emit({ type: "state_update", cascadeId: id, generating, statusText, lastMessage: last });
+      const prevParts = this.lastStepSig.split("|");
+      const curParts = sig.split("|");
+      const canUpdate = this.lastStepSig && prevParts.length === 5 && curParts.length === 5 && prevParts[2] === curParts[2] && // steps.length unchanged
+      prevParts[3] === curParts[3];
+      this.lastStepSig = sig;
+      if (canUpdate && last) {
+        this.emit({
+          type: "state_update",
+          cascadeId: id,
+          generating: effectiveGenerating,
+          statusText,
+          lastMessage: last
+        });
       } else {
-        this.lastStepSig = sig;
         this.emit({
           type: "state",
-          state: { cascadeId: id, generating, statusText, messages }
+          state: { cascadeId: id, generating: effectiveGenerating, statusText, messages }
         });
       }
     }
-    if (generating !== this.lastGenerating || statusText !== this.lastStatusText) {
-      const wasGenerating = this.lastGenerating;
-      this.lastGenerating = generating;
-      this.lastStatusText = statusText;
-      this.emit({ type: "status", cascadeId: id, generating, statusText });
-      if (wasGenerating && !generating) {
-        this.getModels().then((models) => {
-          if (models && models.length > 0)
-            this.emit({ type: "models", models });
-        }).catch(() => {
-        });
-        this.getQuota().then((quota) => {
-          if (quota)
-            this.emit({ type: "quota", quota });
-        }).catch(() => {
-        });
+    if (effectiveGenerating !== this.lastGenerating || statusText !== this.lastStatusText) {
+      if (!this.generatingTimeout) {
+        this.lastGenerating = effectiveGenerating;
+        this.lastStatusText = statusText;
+        this.emit({ type: "status", cascadeId: id, generating: effectiveGenerating, statusText });
+      } else if (statusText !== this.lastStatusText) {
+        this.lastStatusText = statusText;
+        this.emit({ type: "status", cascadeId: id, generating: true, statusText });
       }
     }
   }
@@ -5603,12 +5805,19 @@ function toolInfo(step) {
     }
   }
 }
-function describeStatus(steps) {
-  if (steps.length === 0)
+function describeStatus(steps, generating) {
+  if (!generating || steps.length === 0)
     return "Idle";
   const last = steps[steps.length - 1];
   const type = shortType(last.type);
-  if (type === "PLANNER_RESPONSE")
+  if (type === "PLANNER_RESPONSE") {
+    const status = String(last.status ?? "").toUpperCase();
+    if (status.includes("RUNNING") || status.includes("PENDING") || status.includes("GENERATING")) {
+      return "Thinking";
+    }
+    return "Idle";
+  }
+  if (type === "USER_INPUT")
     return "Thinking";
   const info = toolInfo(last);
   return info.detail ? `${info.verb} ${info.detail}` : info.verb;
@@ -5745,11 +5954,36 @@ function stepsToMessages(steps, cascadeId) {
       const t = String(
         step.userInput?.userResponse ?? step.userInput?.items?.find((i) => i?.text)?.text ?? step.userInput?.items?.[0]?.text ?? ""
       ).trim();
+      const images = [];
+      if (Array.isArray(step.userInput?.items)) {
+        for (const it of step.userInput.items) {
+          const m = it?.media;
+          if (m) {
+            const mime = m.mimeType || "image/png";
+            const data = m.inlineData || m.data;
+            if (data && typeof data === "string") {
+              const src = data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
+              images.push(src);
+            }
+          }
+        }
+      }
+      if (Array.isArray(step.userInput?.media)) {
+        for (const m of step.userInput.media) {
+          const mime = m?.mimeType || "image/png";
+          const data = m?.inlineData || m?.data;
+          if (data && typeof data === "string") {
+            const src = data.startsWith("data:") ? data : `data:${mime};base64,${data}`;
+            images.push(src);
+          }
+        }
+      }
       const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex;
-      if (t)
+      if (t || images.length > 0)
         msgs.push({
           role: "user",
           text: t,
+          images: images.length > 0 ? images : void 0,
           stepIndex: typeof stepIndex === "number" ? stepIndex : void 0
         });
       continue;
@@ -6275,9 +6509,9 @@ var SettingsController = {
         }
       }
       try {
-        const { exec: exec3 } = require("child_process");
-        exec3(`open "cockpit-tools://switch?account_id=${match.id}&email=${encodeURIComponent(email)}"`);
-        exec3(`open "cockpit-tools://switch-account?id=${match.id}&email=${encodeURIComponent(email)}"`);
+        const { exec: exec4 } = require("child_process");
+        exec4(`open "cockpit-tools://switch?account_id=${match.id}&email=${encodeURIComponent(email)}"`);
+        exec4(`open "cockpit-tools://switch-account?id=${match.id}&email=${encodeURIComponent(email)}"`);
       } catch {
       }
       try {

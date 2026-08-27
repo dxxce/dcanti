@@ -21,37 +21,47 @@ interface Props {
 }
 
 interface ChatMsg {
+  id?: string;
   role: string;
   text: string;
   kind?: string;
   detail?: string;
+  images?: string[];
   stepIndex?: number;
+  timestamp?: number;
   meta?: Record<string, unknown>;
 }
 
 // A rendered block is either a single user/assistant/plan message, or a
 // collapsible timeline grouping consecutive tool/system steps.
 type Block =
-  | { type: "msg"; msg: ChatMsg; index: number }
-  | { type: "timeline"; steps: ChatMsg[] };
+  | { type: "msg"; msg: ChatMsg; index: number; id: string }
+  | { type: "timeline"; steps: ChatMsg[]; id: string };
 
 // Fold consecutive tool/system steps into one timeline block so they take up
 // little space and leave room for the real user/assistant messages.
 function toBlocks(messages: ChatMsg[]): Block[] {
   const blocks: Block[] = [];
   let buffer: ChatMsg[] = [];
+  let timelineStartIndex = 0;
+
   const flush = () => {
     if (buffer.length) {
-      blocks.push({ type: "timeline", steps: buffer });
+      const firstStep = buffer[0];
+      const id = `timeline-${timelineStartIndex}-${firstStep.stepIndex ?? ""}`;
+      blocks.push({ type: "timeline", steps: buffer, id });
       buffer = [];
     }
   };
+
   messages.forEach((m, index) => {
     if (m.role === "tool" || m.role === "system") {
+      if (buffer.length === 0) timelineStartIndex = index;
       buffer.push(m);
     } else {
       flush();
-      blocks.push({ type: "msg", msg: m, index });
+      const id = m.id || `msg-${index}-${m.stepIndex ?? ""}-${m.role}`;
+      blocks.push({ type: "msg", msg: m, index, id });
     }
   });
   flush();
@@ -96,52 +106,67 @@ export function ChatPanel({
   const [showJump, setShowJump] = useState(false);
 
   const blocks = useMemo(() => toBlocks(state.messages), [state.messages]);
-  const [offset, setOffset] = useState(0);
-
-  const PAGE_SIZE = 10;
+  const PAGE_SIZE = 40;
   const totalBlocks = blocks.length;
-  const hasMore = totalBlocks > offset + PAGE_SIZE;
 
-  const previousScrollRef = useRef({ height: 0, top: 0 });
+  // Number of blocks hidden at the top of the chat
+  const [hiddenTopCount, setHiddenTopCount] = useState(() =>
+    Math.max(0, totalBlocks - PAGE_SIZE)
+  );
+
+  // When switching to a different cascade, re-initialize hiddenTopCount
+  const lastCascadeId = useRef(state.cascadeId);
+  if (lastCascadeId.current !== state.cascadeId) {
+    lastCascadeId.current = state.cascadeId;
+    setHiddenTopCount(Math.max(0, totalBlocks - PAGE_SIZE));
+  }
+
+  const hasMore = hiddenTopCount > 0;
+  const hiddenCount = hiddenTopCount;
+
+  const previousScrollRef = useRef<{ height: number; top: number } | null>(null);
   const isLoadingMore = useRef(false);
 
   const loadMore = () => {
-    if (isLoadingMore.current) return;
+    if (isLoadingMore.current || !hasMore) return;
     const el = listRef.current;
     if (el) {
       previousScrollRef.current = { height: el.scrollHeight, top: el.scrollTop };
     }
     isLoadingMore.current = true;
-    setOffset((prev) => prev + PAGE_SIZE);
+    setHiddenTopCount((prev) => Math.max(0, prev - PAGE_SIZE));
   };
 
   const visibleBlocks = useMemo(() => {
-    if (totalBlocks <= PAGE_SIZE) return blocks;
-    const end = totalBlocks - offset;
-    const start = Math.max(0, end - PAGE_SIZE);
-    return blocks.slice(start, end);
-  }, [blocks, totalBlocks, offset]);
+    if (hiddenTopCount <= 0) return blocks;
+    return blocks.slice(hiddenTopCount);
+  }, [blocks, hiddenTopCount]);
 
   const onScroll = () => {
     const el = listRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom < 80;
     stickToBottom.current = nearBottom;
     setShowJump(!nearBottom);
 
-    if (el.scrollTop < 60 && hasMore && !isLoadingMore.current) {
+    if (el.scrollTop < 30 && hasMore && !isLoadingMore.current) {
       loadMore();
     }
   };
 
   const scrollToBottomDirect = () => {
+    stickToBottom.current = true;
+    setShowJump(false);
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
   };
 
   useEffect(() => {
-    setOffset(0);
     stickToBottom.current = true;
+    setShowJump(false);
     const doScroll = () => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
     };
@@ -149,20 +174,19 @@ export function ChatPanel({
     requestAnimationFrame(doScroll);
     const t1 = setTimeout(doScroll, 100);
     const t2 = setTimeout(doScroll, 300);
-    const t3 = setTimeout(doScroll, 600);
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
-      clearTimeout(t3);
     };
   }, [state.cascadeId]);
 
   useLayoutEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    if (isLoadingMore.current) {
+    if (isLoadingMore.current && previousScrollRef.current) {
       const heightDiff = el.scrollHeight - previousScrollRef.current.height;
       el.scrollTop = previousScrollRef.current.top + heightDiff;
+      previousScrollRef.current = null;
       isLoadingMore.current = false;
     } else if (stickToBottom.current) {
       el.scrollTop = el.scrollHeight;
@@ -278,13 +302,14 @@ export function ChatPanel({
   const [screenshotLoading, setScreenshotLoading] = useState(false);
 
   const captureScreenshot = async () => {
+    if (screenshotLoading) return;
     setScreenshotLoading(true);
     try {
       const r = await api.screenshot();
       if (r.ok && r.dataUri) {
-        setPending((prev) => [...prev, r.dataUri!]);
+        setScreenshotUri(r.dataUri);
       } else {
-        alert("Không thể chụp màn hình IDE (CDP chưa kết nối).");
+        alert("Không thể chụp màn hình Mac.");
       }
     } catch {
       alert("Lỗi khi kết nối API chụp màn hình.");
@@ -293,8 +318,23 @@ export function ChatPanel({
     }
   };
 
+  const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+
   const [localSelectedId, setLocalSelectedId] = useState<string | null>(null);
   const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
+  const [confirmRevertStepIndex, setConfirmRevertStepIndex] = useState<number | null>(null);
+  const [reverting, setReverting] = useState(false);
+
+  const handleConfirmRevert = async () => {
+    if (confirmRevertStepIndex == null) return;
+    setReverting(true);
+    try {
+      await onRevert(confirmRevertStepIndex);
+    } finally {
+      setReverting(false);
+      setConfirmRevertStepIndex(null);
+    }
+  };
 
   const selectedModel =
     (localSelectedId ? models.find((m) => m.id === localSelectedId || m.label === localSelectedId) : null) ??
@@ -343,9 +383,14 @@ export function ChatPanel({
 
           {hasMore && (
             <div className="load-more-container">
-              <button className="ghost sm load-more-btn" onClick={loadMore}>
+              <button
+                type="button"
+                className="ghost sm load-more-btn"
+                onClick={loadMore}
+                disabled={isLoadingMore.current}
+              >
                 <Icon name="arrowUp" size={13} />
-                <span>Tải thêm tin nhắn cũ ({totalBlocks - offset - PAGE_SIZE} tin nhắn)</span>
+                <span>Tải thêm tin nhắn cũ ({hiddenCount} tin nhắn phía trên)</span>
               </button>
             </div>
           )}
@@ -354,7 +399,7 @@ export function ChatPanel({
             const isLastBlock = i === visibleBlocks.length - 1;
             return b.type === "timeline" ? (
               <Timeline
-                key={`t${i}`}
+                key={b.id}
                 steps={b.steps}
                 live={state.generating && isLastBlock}
                 statusText={state.statusText}
@@ -362,14 +407,15 @@ export function ChatPanel({
               />
             ) : (
               <MessageRow
-                key={`m${b.index}`}
+                key={b.id}
                 msg={b.msg}
-                onRevert={onRevert}
+                onRequestRevert={(stepIndex) => setConfirmRevertStepIndex(stepIndex)}
                 onApprovePlan={onApprovePlan}
                 onAnswerQuestion={onAnswerQuestion}
                 onSkipQuestion={onSkipQuestion}
                 onOpenFile={onOpenFile}
                 onEditPlan={() => taRef.current?.focus()}
+                onPreviewImage={(src) => setLightboxImage(src)}
               />
             );
           })}
@@ -701,8 +747,8 @@ export function ChatPanel({
                       >
                         <Icon name={screenshotLoading ? "spinner" : "camera"} size={16} className={screenshotLoading ? "spin" : ""} />
                         <div className="tools-menu-item-info">
-                          <span className="tools-menu-item-title">Chụp màn hình IDE</span>
-                          <span className="tools-menu-item-desc">Chụp ảnh màn hình IDE và đính kèm vào tin nhắn</span>
+                          <span className="tools-menu-item-title">Chụp màn hình Mac</span>
+                          <span className="tools-menu-item-desc">Chụp toàn màn hình Mac và gửi ngay vào đoạn chat</span>
                         </div>
                       </button>
 
@@ -739,39 +785,251 @@ export function ChatPanel({
       </div>
 
       {screenshotUri && (
-        <div className="modal-backdrop" onClick={() => setScreenshotUri(null)}>
-          <div className="modal-card screenshot-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <div className="modal-title">
-                <Icon name="camera" size={16} /> <span>Màn hình IDE chụp realtime</span>
-              </div>
-              <button className="icon-btn" onClick={() => setScreenshotUri(null)}>
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div className="modal-body screenshot-body">
-              <img src={screenshotUri} alt="IDE Screenshot" />
-            </div>
-            <div className="modal-actions">
-              <a
+        <ImageViewer
+          src={screenshotUri}
+          title="Ảnh chụp màn hình máy Mac"
+          onClose={() => setScreenshotUri(null)}
+          extraActions={
+            <>
+              <button
                 className="btn primary sm"
-                href={screenshotUri}
-                download={`ide_screenshot_${Date.now()}.png`}
+                onClick={async () => {
+                  const uri = screenshotUri;
+                  setScreenshotUri(null);
+                  if (uri) {
+                    await onSend("Đây là ảnh chụp màn hình máy Mac của tôi", [uri]);
+                  }
+                }}
               >
-                <Icon name="upload" size={13} /> <span>Tải về</span>
+                <Icon name="upload" size={13} /> <span>Gửi vào chat</span>
+              </button>
+              <a
+                className="btn ghost sm"
+                href={screenshotUri}
+                download={`mac_screenshot_${Date.now()}.png`}
+              >
+                <Icon name="save" size={13} /> <span>Tải về</span>
               </a>
-              <button className="ghost sm" onClick={captureScreenshot} disabled={screenshotLoading}>
+              <button className="btn ghost sm" onClick={captureScreenshot} disabled={screenshotLoading}>
                 <Icon name={screenshotLoading ? "spinner" : "refresh"} size={13} className={screenshotLoading ? "spin" : ""} />
                 <span>Chụp lại</span>
               </button>
-              <button className="ghost sm" onClick={() => setScreenshotUri(null)}>
+              <button className="btn ghost sm" onClick={() => setScreenshotUri(null)}>
                 <span>Đóng</span>
+              </button>
+            </>
+          }
+        />
+      )}
+
+      {confirmRevertStepIndex != null && (
+        <div
+          className="revert-modal-overlay"
+          onClick={() => !reverting && setConfirmRevertStepIndex(null)}
+        >
+          <div className="revert-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="revert-modal-icon">
+              <Icon name="revert" size={24} />
+            </div>
+            <div className="revert-modal-title">Xác nhận khôi phục (Revert)</div>
+            <div className="revert-modal-desc">
+              Bạn có chắc chắn muốn hoàn tác mã nguồn và lịch sử hội thoại về bước này (Bước #{confirmRevertStepIndex})? Tất cả các thay đổi và tin nhắn sau bước này sẽ bị hủy bỏ.
+            </div>
+            <div className="revert-modal-actions">
+              <button
+                type="button"
+                className="ghost"
+                disabled={reverting}
+                onClick={() => setConfirmRevertStepIndex(null)}
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={reverting}
+                onClick={handleConfirmRevert}
+              >
+                {reverting ? (
+                  <Icon name="spinner" size={14} className="spin" />
+                ) : (
+                  <Icon name="revert" size={14} />
+                )}
+                <span>{reverting ? "Đang khôi phục…" : "Xác nhận khôi phục"}</span>
               </button>
             </div>
           </div>
         </div>
       )}
+
+      {lightboxImage && (
+        <ImageViewer
+          src={lightboxImage}
+          title="Xem ảnh phóng to"
+          onClose={() => setLightboxImage(null)}
+        />
+      )}
     </section>
+  );
+}
+
+// Full-featured Zoom & Pan Image Viewer Modal
+function ImageViewer({
+  src,
+  title,
+  onClose,
+  extraActions,
+}: {
+  src: string;
+  title?: string;
+  onClose: () => void;
+  extraActions?: React.ReactNode;
+}) {
+  const [scale, setScale] = useState(1);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const zoomIn = () => setScale((s) => Math.min(Number((s + 0.5).toFixed(1)), 4));
+  const zoomOut = () => {
+    setScale((s) => {
+      const next = Math.max(Number((s - 0.5).toFixed(1)), 1);
+      if (next === 1) setPos({ x: 0, y: 0 });
+      return next;
+    });
+  };
+  const resetZoom = () => {
+    setScale(1);
+    setPos({ x: 0, y: 0 });
+  };
+
+  const handleDoubleClick = () => {
+    if (scale > 1) {
+      resetZoom();
+    } else {
+      setScale(2.5);
+    }
+  };
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      containerRef.current?.requestFullscreen?.().catch(() => {});
+    } else {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      else if (e.key === "+" || e.key === "=") zoomIn();
+      else if (e.key === "-") zoomOut();
+      else if (e.key === "0") resetZoom();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (scale <= 1) return;
+    setIsDragging(true);
+    dragStart.current = { x: e.clientX - pos.x, y: e.clientY - pos.y };
+  };
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging) return;
+    setPos({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y });
+  };
+  const handleMouseUp = () => setIsDragging(false);
+
+  const lastTap = useRef<number>(0);
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const now = Date.now();
+    if (now - lastTap.current < 300) {
+      handleDoubleClick();
+      lastTap.current = 0;
+      return;
+    }
+    lastTap.current = now;
+    if (e.touches.length === 1 && scale > 1) {
+      setIsDragging(true);
+      dragStart.current = { x: e.touches[0].clientX - pos.x, y: e.touches[0].clientY - pos.y };
+    }
+  };
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!isDragging || e.touches.length !== 1) return;
+    setPos({ x: e.touches[0].clientX - dragStart.current.x, y: e.touches[0].clientY - dragStart.current.y });
+  };
+  const handleTouchEnd = () => setIsDragging(false);
+
+  return (
+    <div className="img-viewer-backdrop" onClick={onClose} ref={containerRef}>
+      <div className="img-viewer-card" onClick={(e) => e.stopPropagation()}>
+        <div className="img-viewer-header">
+          <div className="img-viewer-title">
+            <Icon name="eye" size={15} />
+            <span>{title || "Xem ảnh"}</span>
+            {scale > 1 && <span className="zoom-badge">{Math.round(scale * 100)}%</span>}
+          </div>
+          <div className="img-viewer-controls">
+            <button className="icon-btn sm" onClick={zoomOut} disabled={scale <= 1} title="Thu nhỏ (-)">
+              <span style={{ fontSize: "16px", fontWeight: "bold", lineHeight: 1 }}>−</span>
+            </button>
+            <button className="icon-btn sm" onClick={resetZoom} disabled={scale === 1 && pos.x === 0 && pos.y === 0} title="Mặc định (100%)">
+              <span style={{ fontSize: "11px", fontWeight: "bold" }}>1x</span>
+            </button>
+            <button className="icon-btn sm" onClick={zoomIn} disabled={scale >= 4} title="Phóng to (+)">
+              <Icon name="plus" size={14} />
+            </button>
+            <button className="icon-btn sm" onClick={toggleFullscreen} title="Toàn màn hình">
+              <Icon name="eye" size={14} />
+            </button>
+            <a
+              className="icon-btn sm"
+              href={src}
+              download={`image_${Date.now()}.png`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Tải về"
+            >
+              <Icon name="save" size={14} />
+            </a>
+            <button className="icon-btn sm danger-hover" onClick={onClose} title="Đóng (Esc)">
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+        </div>
+
+        <div
+          className={`img-viewer-stage ${scale > 1 ? "is-zoomed" : ""} ${isDragging ? "is-dragging" : ""}`}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onDoubleClick={handleDoubleClick}
+        >
+          <img
+            src={src}
+            alt="Preview"
+            className="img-viewer-img"
+            style={{
+              transform: `translate(${pos.x}px, ${pos.y}px) scale(${scale})`,
+              cursor: scale > 1 ? (isDragging ? "grabbing" : "grab") : "zoom-in",
+            }}
+            draggable={false}
+          />
+        </div>
+
+        {extraActions && (
+          <div className="img-viewer-footer">
+            {extraActions}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -944,6 +1202,16 @@ function fileToBase64(file: File): Promise<string> {
 // steps (so the reader sees what the agent is doing without the list eating the
 // whole view); older steps collapse behind a "show all" toggle.
 const TIMELINE_VISIBLE = 5;
+
+function getStepKey(s: ChatMsg, index: number): string {
+  if (s.id) return s.id;
+  if (s.stepIndex != null) return `step-${s.stepIndex}`;
+  const textSig = (s.text || "").slice(0, 30);
+  const dur = s.meta?.durationMs ?? "";
+  const tok = s.meta?.tokens ?? "";
+  return `step-${index}-${s.kind || ""}-${textSig}-${dur}-${tok}`;
+}
+
 function Timeline({
   steps,
   live,
@@ -955,25 +1223,56 @@ function Timeline({
   statusText?: string;
   onOpenFile?: (path: string) => void | Promise<void>;
 }) {
-  const [showAll, setShowAll] = useState(false);
+  // Default to expanded so steps are never unexpectedly hidden/collapsed.
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+
+  // Set of opened step keys — preserves opened state across step additions and live updates!
+  const [openStepKeys, setOpenStepKeys] = useState<Set<string>>(() => new Set());
+
+  const toggleStep = (key: string) => {
+    setOpenStepKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const isExpanded = userExpanded !== null ? userExpanded : true;
   const hidden = Math.max(0, steps.length - TIMELINE_VISIBLE);
-  const visible = showAll ? steps : steps.slice(steps.length - TIMELINE_VISIBLE);
+  const visibleSteps = isExpanded ? steps : steps.slice(steps.length - TIMELINE_VISIBLE);
 
   return (
     <div className="timeline">
       {hidden > 0 && (
-        <button className="timeline-head" onClick={() => setShowAll((v) => !v)}>
-          <Icon name={showAll ? "chevronDown" : "chevronRight"} size={13} />
+        <button
+          type="button"
+          className="timeline-head"
+          onClick={() => setUserExpanded(!isExpanded)}
+        >
+          <Icon name={isExpanded ? "chevronDown" : "chevronRight"} size={13} />
           <Icon name="terminal" size={13} className="timeline-icon" />
           <span className="timeline-summary">
-            {showAll ? "Ẩn bớt" : `Xem thêm ${hidden} bước trước`}
+            {isExpanded ? "Ẩn bớt" : `Xem thêm ${hidden} bước trước`}
           </span>
         </button>
       )}
       <ul className="timeline-list">
-        {visible.map((s, i) => (
-          <TimelineStep key={i} step={s} onOpenFile={onOpenFile} />
-        ))}
+        {visibleSteps.map((s, i) => {
+          const actualIndex = isExpanded ? i : steps.length - TIMELINE_VISIBLE + i;
+          const stepKey = getStepKey(s, actualIndex);
+          const isOpen = openStepKeys.has(stepKey);
+
+          return (
+            <TimelineStep
+              key={stepKey}
+              step={s}
+              open={isOpen}
+              onToggle={() => toggleStep(stepKey)}
+              onOpenFile={onOpenFile}
+            />
+          );
+        })}
         {live && (
           <li className="timeline-step timeline-live">
             <span className="timeline-step-head">
@@ -1000,12 +1299,15 @@ function fmtDuration(ms: number): string {
 
 function TimelineStep({
   step,
+  open,
+  onToggle,
   onOpenFile,
 }: {
   step: ChatMsg;
+  open: boolean;
+  onToggle: () => void;
   onOpenFile?: (path: string) => void | Promise<void>;
 }) {
-  const [open, setOpen] = useState(false);
   const icon = KIND_ICON[step.kind || "tool"] || "terminal";
   const durationMs = typeof step.meta?.durationMs === "number" ? step.meta.durationMs : 0;
   const tokens = typeof step.meta?.tokens === "number" ? step.meta.tokens : 0;
@@ -1022,7 +1324,7 @@ function TimelineStep({
     <li className="timeline-step">
       <span
         className="timeline-step-head"
-        onClick={() => hasDetail && setOpen((v) => !v)}
+        onClick={() => hasDetail && onToggle()}
         style={{ cursor: hasDetail ? "pointer" : "default" }}
       >
         <span className="tstep-left">
@@ -1070,15 +1372,16 @@ function TimelineStep({
 // A real message: user / assistant / plan / ask get an avatar + bubble.
 function MessageRow({
   msg,
-  onRevert,
+  onRequestRevert,
   onApprovePlan,
   onAnswerQuestion,
   onSkipQuestion,
   onOpenFile,
   onEditPlan,
+  onPreviewImage,
 }: {
   msg: ChatMsg;
-  onRevert: (stepIndex: number) => void | Promise<void>;
+  onRequestRevert?: (stepIndex: number) => void;
   onApprovePlan: (artifactUri: string, approved: boolean) => void | Promise<void>;
   onAnswerQuestion: (
     stepIndex: number,
@@ -1087,6 +1390,7 @@ function MessageRow({
   onSkipQuestion: (stepIndex: number) => void | Promise<void>;
   onOpenFile: (path: string) => void | Promise<void>;
   onEditPlan: () => void;
+  onPreviewImage?: (src: string) => void;
 }) {
   // The agent asked a question — render an inline card with the options.
   if (msg.role === "ask") {
@@ -1130,6 +1434,7 @@ function MessageRow({
         onApprovePlan={onApprovePlan}
         onOpenFile={onOpenFile}
         onEditPlan={onEditPlan}
+        onPreviewImage={onPreviewImage}
       />
     );
   }
@@ -1145,10 +1450,25 @@ function MessageRow({
           {isUser ? (
             <>
               {msg.text && <pre>{msg.text}</pre>}
-
+              {Array.isArray(msg.images) && msg.images.length > 0 && (
+                <div className="msg-images">
+                  {msg.images.map((img, idx) => {
+                    const src = img.startsWith("data:") || img.startsWith("http") ? img : `/api/media?path=${encodeURIComponent(img)}`;
+                    return (
+                      <img
+                        key={idx}
+                        src={src}
+                        alt="attachment"
+                        className="msg-img-thumb"
+                        onClick={() => onPreviewImage && onPreviewImage(src)}
+                      />
+                    );
+                  })}
+                </div>
+              )}
             </>
           ) : (
-            <Markdown text={msg.text} onOpenFile={onOpenFile} />
+            <Markdown text={msg.text} onOpenFile={onOpenFile} onPreviewImage={onPreviewImage} />
           )}
         </div>
         {!isUser && (msg.meta?.turnTokens != null || msg.meta?.tokens != null) && (
@@ -1173,7 +1493,7 @@ function MessageRow({
           <button
             className="msg-revert"
             title="Hoàn tác code về đúng thời điểm này"
-            onClick={() => onRevert(msg.stepIndex!)}
+            onClick={() => onRequestRevert && onRequestRevert(msg.stepIndex!)}
           >
             <Icon name="revert" size={12} /> <span>Revert về đây</span>
           </button>
@@ -1191,11 +1511,13 @@ function PlanCard({
   onApprovePlan,
   onOpenFile,
   onEditPlan,
+  onPreviewImage,
 }: {
   msg: ChatMsg;
   onApprovePlan: (artifactUri: string, approved: boolean) => void | Promise<void>;
   onOpenFile: (path: string) => void | Promise<void>;
   onEditPlan: () => void;
+  onPreviewImage?: (src: string) => void;
 }) {
   const artifactUri = String(msg.meta?.artifactUri ?? "");
   const answered = Boolean(msg.meta?.answered);
@@ -1222,7 +1544,7 @@ function PlanCard({
           <Icon name="check" size={12} /> <span>Kế hoạch triển khai</span>
         </div>
         <div className="bubble">
-          <Markdown text={msg.text} onOpenFile={onOpenFile} />
+          <Markdown text={msg.text} onOpenFile={onOpenFile} onPreviewImage={onPreviewImage} />
         </div>
         {!answered && artifactUri && (
           <div className="plan-actions">

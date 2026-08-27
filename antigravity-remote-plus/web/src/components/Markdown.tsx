@@ -30,6 +30,20 @@ function renderInline(text: string): string {
     codeSpans.push(c);
     return `\u0000CODESPAN_${codeSpans.length - 1}\u0000`;
   });
+  // markdown images ![alt](url)
+  out = out.replace(
+    /!\[([^\]]*)\]\((file:\/\/[^\s)]+|https?:\/\/[^\s)]+|\/[^\s)]+|data:image\/[^\s)]+)\)/g,
+    (_m, alt, src) => {
+      let imgSrc = src;
+      if (imgSrc.startsWith("file://")) {
+        const path = decodeURIComponent(imgSrc.replace(/^file:\/\//, ""));
+        imgSrc = `/api/media?path=${encodeURIComponent(path)}`;
+      } else if (imgSrc.startsWith("/") && !imgSrc.startsWith("/api/")) {
+        imgSrc = `/api/media?path=${encodeURIComponent(imgSrc)}`;
+      }
+      return `<div class="chat-img-wrap"><img src="${escapeHtml(imgSrc)}" alt="${escapeHtml(alt)}" class="chat-msg-img" loading="lazy" />${alt ? `<span class="chat-img-caption">${escapeHtml(alt)}</span>` : ""}</div>`;
+    }
+  );
   // file links [text](file:///path) — clickable, opens in Files
   out = out.replace(
     /\[([^\]]+)\]\((file:\/\/[^\s)]+)\)/g,
@@ -256,18 +270,27 @@ function CodeBlock({ lang, content }: { lang?: string; content: string }) {
 export function Markdown({
   text,
   onOpenFile,
+  onPreviewImage,
 }: {
   text: string;
   onOpenFile?: (path: string) => void;
+  onPreviewImage?: (src: string) => void;
 }) {
   const blocks = parseBlocks(text);
-  // Intercept clicks on file links so they open in the Files tab.
+  // Intercept clicks on file links and image previews
   const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const target = (e.target as HTMLElement).closest<HTMLElement>("a.file-link");
-    if (target) {
+    const fileTarget = (e.target as HTMLElement).closest<HTMLElement>("a.file-link");
+    if (fileTarget) {
       e.preventDefault();
-      const p = target.getAttribute("data-file");
+      const p = fileTarget.getAttribute("data-file");
       if (p && onOpenFile) onOpenFile(p);
+      return;
+    }
+    const imgTarget = (e.target as HTMLElement).closest<HTMLImageElement>("img.chat-msg-img");
+    if (imgTarget) {
+      e.preventDefault();
+      const src = imgTarget.getAttribute("src");
+      if (src && onPreviewImage) onPreviewImage(src);
     }
   };
   return (
