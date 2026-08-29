@@ -22,10 +22,13 @@ export function Login({ onLogin }: { onLogin: (pw: string) => Promise<boolean> }
   return (
     <div className="center">
       <form className="login" onSubmit={submit}>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+          <img src="/icon.png" alt="Logo" style={{ width: 52, height: 52, borderRadius: 12, boxShadow: "0 4px 20px rgba(124, 92, 255, 0.35)" }} />
+        </div>
         <h1>
-          <span className="dot" /> Antigravity Remote Plus
+          Antigravity Remote Plus
         </h1>
-        <p className="muted">Enter password to continue</p>
+        <p className="muted">Nhập mật khẩu để tiếp tục</p>
         <input
           type="password"
           value={pw}

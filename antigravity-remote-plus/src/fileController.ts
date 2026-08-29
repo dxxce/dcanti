@@ -76,6 +76,74 @@ export const FileController = {
     return out;
   },
 
+  searchFiles(query = "", limit = 60): FileEntry[] {
+    const root = workspaceRoot();
+    if (!root || !fs.existsSync(root)) return [];
+
+    const q = query.trim().toLowerCase();
+    const results: FileEntry[] = [];
+    const IGNORE_DIRS = new Set([
+      ".git",
+      "node_modules",
+      ".next",
+      "dist",
+      "out",
+      ".gemini",
+      "build",
+      ".vscode",
+      ".idea",
+    ]);
+
+    const walk = (dir: string, currentDepth: number) => {
+      if (results.length >= limit || currentDepth > 8) return;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        if (results.length >= limit) break;
+        if (IGNORE_DIRS.has(entry.name)) continue;
+
+        const fullPath = path.join(dir, entry.name);
+        const relPath = path.relative(root, fullPath).split(path.sep).join("/");
+
+        const matches = !q || entry.name.toLowerCase().includes(q) || relPath.toLowerCase().includes(q);
+
+        if (entry.isDirectory()) {
+          if (matches) {
+            results.push({ name: entry.name, path: relPath, type: "dir" });
+          }
+          walk(fullPath, currentDepth + 1);
+        } else if (entry.isFile()) {
+          if (matches) {
+            let size = 0;
+            try {
+              size = fs.statSync(fullPath).size;
+            } catch {}
+            results.push({ name: entry.name, path: relPath, type: "file", size });
+          }
+        }
+      }
+    };
+
+    walk(root, 0);
+
+    // Sort: directories first or exact matches first, then alphabetically
+    results.sort((a, b) => {
+      const aExact = a.name.toLowerCase() === q;
+      const bExact = b.name.toLowerCase() === q;
+      if (aExact && !bExact) return -1;
+      if (!aExact && bExact) return 1;
+      if (a.type === b.type) return a.path.localeCompare(b.path);
+      return a.type === "dir" ? -1 : 1;
+    });
+
+    return results.slice(0, limit);
+  },
+
   read(rel: string): { text: string } | { error: string } {
     const abs = resolveSafe(rel);
     if (!abs) return { error: "invalid path" };

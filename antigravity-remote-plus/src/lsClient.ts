@@ -197,6 +197,7 @@ function lsPost(
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(payload),
           "x-codeium-csrf-token": conn.csrfToken,
+          "connect-protocol-version": "1",
         },
         rejectUnauthorized: false,
         timeout: 8000,
@@ -709,17 +710,73 @@ export class LsClient {
     stepIndex: number,
     responses: any[]
   ): Promise<boolean> {
-    // The IDE wraps the interaction payload in an `interaction` object and
-    // includes the cascadeId at the top level (not just the trajectoryId).
-    const body = await this.call("HandleCascadeUserInteraction", {
+    const formattedResponses = (Array.isArray(responses) ? responses : []).map(
+      (r) => {
+        const opts = Array.isArray(r.options)
+          ? r.options.map((o: any, idx: number) => {
+              if (typeof o === "string") {
+                return { id: String(idx + 1), text: o };
+              }
+              return {
+                id: String(o.id ?? idx + 1),
+                text: String(o.text ?? o),
+              };
+            })
+          : [];
+        const entry: any = {
+          question: String(r.question || ""),
+          options: opts,
+        };
+        if (r.skipped) {
+          entry.skipped = true;
+        }
+        if (
+          Array.isArray(r.selectedOptionIds) &&
+          r.selectedOptionIds.length > 0
+        ) {
+          entry.selectedOptionIds = r.selectedOptionIds.map(String);
+        }
+        if (r.writeInResponse) {
+          entry.writeInResponse = String(r.writeInResponse);
+        }
+        return entry;
+      }
+    );
+
+    const trajId = trajectoryId || cascadeId;
+
+    // 1. Primary format matching IDE DevTools exactly
+    const body1 = await this.call("HandleCascadeUserInteraction", {
       cascadeId,
       interaction: {
-        trajectoryId,
+        trajectoryId: trajId,
         stepIndex,
-        askQuestion: { responses },
+        askQuestion: { responses: formattedResponses },
       },
     });
-    return body !== null;
+    if (body1 !== null) return true;
+
+    // 2. Fallback format with userInteraction
+    const body2 = await this.call("HandleCascadeUserInteraction", {
+      cascadeId,
+      userInteraction: {
+        trajectoryId: trajId,
+        stepIndex,
+        askQuestion: { responses: formattedResponses },
+      },
+    });
+    if (body2 !== null) return true;
+
+    // 3. Fallback snake_case
+    const body3 = await this.call("HandleCascadeUserInteraction", {
+      cascade_id: cascadeId,
+      interaction: {
+        trajectory_id: trajId,
+        step_index: stepIndex,
+        ask_question: { responses: formattedResponses },
+      },
+    });
+    return body3 !== null;
   }
 
   // Revert code + conversation back to a specific step (checkpoint). This is
@@ -757,7 +814,7 @@ function buildCascadeConfig(modelId: string): any {
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" },
         permissionConfig: { defaultGrants: { ask: ["read_url(*)"] } },
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M298" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true },
     },
@@ -782,7 +839,7 @@ function buildOverrideConfig(modelId: string): any {
         },
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" },
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M298" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true },
     },
@@ -790,14 +847,53 @@ function buildOverrideConfig(modelId: string): any {
   };
 }
 
-// --- helpers for interpreting a trajectory ---
-
 export function extractSteps(trajectoryData: any): TrajectoryStep[] {
-  const steps =
+  const rawSteps =
     trajectoryData?.trajectory?.steps ??
     trajectoryData?.steps ??
     [];
-  return Array.isArray(steps) ? steps : [];
+  if (!Array.isArray(rawSteps)) return [];
+
+  // Prune steps that were superseded / rolled back by a revert
+  const result: TrajectoryStep[] = [];
+  for (const step of rawSteps as any[]) {
+    if (!step) continue;
+    if (
+      step.metadata?.isReverted ||
+      step.metadata?.deleted ||
+      step.metadata?.undone ||
+      step.isDeleted ||
+      step.reverted ||
+      step.undone
+    ) {
+      continue;
+    }
+    const status = String(step.status ?? "").toUpperCase();
+    if (status === "REVERTED" || status === "DELETED" || status === "UNDONE") {
+      continue;
+    }
+
+    const idx =
+      step.stepIndex ??
+      step.step_index ??
+      step.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+    if (typeof idx === "number" && idx > 0) {
+      while (result.length > 0) {
+        const last: any = result[result.length - 1];
+        const lastIdx =
+          last.stepIndex ??
+          last.step_index ??
+          last.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+        if (typeof lastIdx === "number" && lastIdx >= idx) {
+          result.pop();
+        } else {
+          break;
+        }
+      }
+    }
+    result.push(step);
+  }
+  return result;
 }
 
 // The trajectory is "generating" if the overall cascade status is RUNNING/PENDING

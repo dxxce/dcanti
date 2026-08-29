@@ -3933,7 +3933,8 @@ function lsPost(conn, method, payloadObj) {
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(payload),
-          "x-codeium-csrf-token": conn.csrfToken
+          "x-codeium-csrf-token": conn.csrfToken,
+          "connect-protocol-version": "1"
         },
         rejectUnauthorized: false,
         timeout: 8e3
@@ -4368,15 +4369,63 @@ var LsClient = class {
   // Answer an ask_question interaction. The agent pauses on an ASK_QUESTION step;
   // this submits the user's selected option ids (and/or free text) so it resumes.
   async handleUserInteraction(cascadeId, trajectoryId, stepIndex, responses) {
-    const body = await this.call("HandleCascadeUserInteraction", {
+    const formattedResponses = (Array.isArray(responses) ? responses : []).map(
+      (r) => {
+        const opts = Array.isArray(r.options) ? r.options.map((o, idx) => {
+          if (typeof o === "string") {
+            return { id: String(idx + 1), text: o };
+          }
+          return {
+            id: String(o.id ?? idx + 1),
+            text: String(o.text ?? o)
+          };
+        }) : [];
+        const entry = {
+          question: String(r.question || ""),
+          options: opts
+        };
+        if (r.skipped) {
+          entry.skipped = true;
+        }
+        if (Array.isArray(r.selectedOptionIds) && r.selectedOptionIds.length > 0) {
+          entry.selectedOptionIds = r.selectedOptionIds.map(String);
+        }
+        if (r.writeInResponse) {
+          entry.writeInResponse = String(r.writeInResponse);
+        }
+        return entry;
+      }
+    );
+    const trajId = trajectoryId || cascadeId;
+    const body1 = await this.call("HandleCascadeUserInteraction", {
       cascadeId,
       interaction: {
-        trajectoryId,
+        trajectoryId: trajId,
         stepIndex,
-        askQuestion: { responses }
+        askQuestion: { responses: formattedResponses }
       }
     });
-    return body !== null;
+    if (body1 !== null)
+      return true;
+    const body2 = await this.call("HandleCascadeUserInteraction", {
+      cascadeId,
+      userInteraction: {
+        trajectoryId: trajId,
+        stepIndex,
+        askQuestion: { responses: formattedResponses }
+      }
+    });
+    if (body2 !== null)
+      return true;
+    const body3 = await this.call("HandleCascadeUserInteraction", {
+      cascade_id: cascadeId,
+      interaction: {
+        trajectory_id: trajId,
+        step_index: stepIndex,
+        ask_question: { responses: formattedResponses }
+      }
+    });
+    return body3 !== null;
   }
   // Revert code + conversation back to a specific step (checkpoint). This is
   // the real Antigravity revert: it restores files to the state they were in at
@@ -4406,7 +4455,7 @@ function buildCascadeConfig(modelId) {
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" },
         permissionConfig: { defaultGrants: { ask: ["read_url(*)"] } }
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M298" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true }
     },
@@ -4428,7 +4477,7 @@ function buildOverrideConfig(modelId) {
         },
         notifyUser: { artifactReviewMode: "ARTIFACT_REVIEW_MODE_ALWAYS" }
       },
-      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M36" },
+      requestedModel: { model: modelId || "MODEL_PLACEHOLDER_M298" },
       ephemeralMessagesConfig: { enabled: true },
       knowledgeConfig: { enabled: true }
     },
@@ -4436,8 +4485,35 @@ function buildOverrideConfig(modelId) {
   };
 }
 function extractSteps(trajectoryData) {
-  const steps = trajectoryData?.trajectory?.steps ?? trajectoryData?.steps ?? [];
-  return Array.isArray(steps) ? steps : [];
+  const rawSteps = trajectoryData?.trajectory?.steps ?? trajectoryData?.steps ?? [];
+  if (!Array.isArray(rawSteps))
+    return [];
+  const result = [];
+  for (const step of rawSteps) {
+    if (!step)
+      continue;
+    if (step.metadata?.isReverted || step.metadata?.deleted || step.metadata?.undone || step.isDeleted || step.reverted || step.undone) {
+      continue;
+    }
+    const status = String(step.status ?? "").toUpperCase();
+    if (status === "REVERTED" || status === "DELETED" || status === "UNDONE") {
+      continue;
+    }
+    const idx = step.stepIndex ?? step.step_index ?? step.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+    if (typeof idx === "number" && idx > 0) {
+      while (result.length > 0) {
+        const last = result[result.length - 1];
+        const lastIdx = last.stepIndex ?? last.step_index ?? last.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+        if (typeof lastIdx === "number" && lastIdx >= idx) {
+          result.pop();
+        } else {
+          break;
+        }
+      }
+    }
+    result.push(step);
+  }
+  return result;
 }
 function isGenerating(steps, trajectoryStatus) {
   if (trajectoryStatus) {
@@ -4894,6 +4970,180 @@ var CdpClient = class {
       return false;
     }
   }
+  /**
+   * Switch/open a conversation by ID in the IDE webview/DOM.
+   */
+  async openConversation(conversationId) {
+    if (!conversationId || !await this.ensure())
+      return false;
+    const json = JSON.stringify(conversationId);
+    const expr = `(() => {
+      const id = ${json};
+      function searchAndClick(root) {
+        if (!root) return false;
+        try {
+          const el = root.querySelector(\`[data-cascade-id="\${id}"], [data-conversation-id="\${id}"], [data-id="\${id}"]\`);
+          if (el) {
+            (el).click();
+            return true;
+          }
+          const links = Array.from(root.querySelectorAll('a, button, div, span, [role="treeitem"], [role="listitem"]'));
+          for (const l of links) {
+            const href = l.getAttribute('href') || '';
+            const key = l.getAttribute('data-key') || '';
+            const title = l.getAttribute('title') || '';
+            if (href.includes(id) || key.includes(id) || title.includes(id)) {
+              (l).click();
+              return true;
+            }
+          }
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc && searchAndClick(doc)) return true;
+          } catch {}
+        }
+        return false;
+      }
+      return searchAndClick(document);
+    })()`;
+    try {
+      return await this.session.evaluate(expr);
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * Click revert button for a specific step in the IDE DOM.
+   */
+  async revertToStep(stepIndex) {
+    if (stepIndex == null || !await this.ensure())
+      return false;
+    const expr = `(() => {
+      const target = ${stepIndex};
+      function searchAndClick(root) {
+        if (!root) return false;
+        try {
+          const btns = Array.from(root.querySelectorAll('button, [role="button"], [data-step-index], [data-index]'));
+          for (const b of btns) {
+            const stepAttr = b.getAttribute('data-step-index') || b.getAttribute('data-index') || '';
+            const t = (b.textContent || b.getAttribute('title') || b.getAttribute('aria-label') || '').toLowerCase();
+            if ((t.includes('revert') || t.includes('quay l\u1EA1i')) && (stepAttr === String(target) || !stepAttr)) {
+              (b).click();
+              return true;
+            }
+          }
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc && searchAndClick(doc)) return true;
+          } catch {}
+        }
+        return false;
+      }
+      return searchAndClick(document);
+    })()`;
+    try {
+      return await this.session.evaluate(expr);
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * Answer or skip an interactive question directly inside the IDE DOM.
+   */
+  async answerQuestion(options) {
+    if (!await this.ensure())
+      return false;
+    const json = JSON.stringify(options || {});
+    const expr = `(() => {
+      const opts = ${json};
+      function searchAll(root) {
+        if (!root) return [];
+        let res = [];
+        try {
+          res.push(...Array.from(root.querySelectorAll('button, [role="button"], input, textarea, .interactive-card, [data-testid]')));
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc) res.push(...searchAll(doc));
+          } catch {}
+        }
+        return res;
+      }
+
+      const elements = searchAll(document);
+      const norm = (s) => (s || '').toLowerCase().trim();
+
+      if (opts.isSkip) {
+        const skipBtn = elements.find(el => {
+          const t = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (t === 'skip' || t.includes('skip') || t.includes('b\u1ECF qua'));
+        });
+        if (skipBtn) {
+          try { (skipBtn).click(); return true; } catch {}
+        }
+      }
+
+      if (opts.freeText) {
+        const input = elements.find(el => {
+          return (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (
+            norm(el.placeholder).includes('type') ||
+            norm(el.placeholder).includes('nh\u1EADp') ||
+            norm(el.placeholder).includes('other') ||
+            norm(el.placeholder).includes('answer')
+          );
+        });
+        if (input) {
+          try {
+            (input).focus();
+            (input).value = opts.freeText;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch {}
+        }
+      }
+
+      if (Array.isArray(opts.optionIndices) && opts.optionIndices.length > 0) {
+        const optionBtns = elements.filter(el => {
+          const cl = norm(el.className);
+          const t = norm(el.innerText || el.textContent);
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (cl.includes('option') || cl.includes('choice') || /^[0-9]\\b/.test(t));
+        });
+        for (const idx of opts.optionIndices) {
+          const target = optionBtns[idx] || optionBtns.find(b => norm(b.innerText).startsWith(String(idx + 1)));
+          if (target) {
+            try { (target).click(); } catch {}
+          }
+        }
+      }
+
+      // Finally find and click "Submit" button
+      if (!opts.isSkip) {
+        const submitBtn = elements.find(el => {
+          const t = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (t === 'submit' || t.includes('submit') || t.includes('g\u1EEDi'));
+        });
+        if (submitBtn) {
+          try { (submitBtn).click(); return true; } catch {}
+        }
+      }
+
+      return false;
+    })()`;
+    try {
+      return await this.session.evaluate(expr);
+    } catch (e) {
+      this.log(`[cdp] answerQuestion failed: ${e.message}`);
+      return false;
+    }
+  }
 };
 
 // src/chatController.ts
@@ -4921,16 +5171,15 @@ var ChatController = class {
     // Remembered model preference (LS has no set-model RPC; we persist the user's
     // choice and mark it selected in the list + attempt it via CDP).
     this.selectedModelId = "";
-    // Sticky selection: once the user picks a conversation or creates a new one,
-    // the poller must NOT auto-jump back to whatever cascade happens to be RUNNING
-    // (an older long-running chat). We only auto-resolve when nothing is chosen.
     this.userSelected = false;
     this.generatingTimeout = null;
+    this.sendingUntil = 0;
     // Pending "new chat": startNewConversation doesn't create a trajectory until
     // the first message is sent, so we show an empty transcript and suppress the
     // poller until a brand-new cascade id appears (or the user sends a message).
     this.pendingNewChat = false;
     this.knownIdsAtNewChat = /* @__PURE__ */ new Set();
+    this.revertCheckpoints = /* @__PURE__ */ new Map();
     this.ls = ls2;
     this.log = log2;
     this.cdp = new CdpClient(log2);
@@ -5087,9 +5336,14 @@ var ChatController = class {
     if (!text.trim() && (!images || images.length === 0))
       return;
     this.userSelected = true;
+    this.sendingUntil = Date.now() + 6e3;
+    this.lastGenerating = true;
+    this.lastStatusText = "Thinking";
     const isNew = this.pendingNewChat;
     const id = isNew ? "" : this.activeCascadeId || await this.resolveActiveCascadeId();
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
+    if (id)
+      this.revertCheckpoints.delete(id);
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M298";
     let sent = false;
     const mediaItems = [];
     if (images && images.length > 0) {
@@ -5130,6 +5384,9 @@ var ChatController = class {
     }
     try {
       await vscode.commands.executeCommand("workbench.action.chat.open");
+      if (id) {
+        await this.switchCascade(id);
+      }
     } catch {
     }
     if (!isNew && id) {
@@ -5183,10 +5440,25 @@ var ChatController = class {
       this.lastStepSig = "";
       this.lastGenerating = true;
       this.lastStatusText = "Thinking";
-      const id2 = this.activeCascadeId;
-      if (id2) {
-        this.emit({ type: "status", cascadeId: id2, generating: true, statusText: "Thinking" });
+      for (let i = 0; i < 12; i++) {
+        await delay(100);
+        const data = id ? await this.ls.getTrajectory(id) : null;
+        const steps = extractSteps(data);
+        const hasNewUserStep = steps.some((s) => {
+          const type = shortType(s?.type);
+          if (type !== "USER_INPUT")
+            return false;
+          const uText = String(
+            s.userInput?.userResponse ?? s.userInput?.items?.find((it) => it?.text)?.text ?? s.userInput?.items?.[0]?.text ?? ""
+          ).trim();
+          return uText === text.trim() || text.trim().includes(uText);
+        });
+        if (hasNewUserStep) {
+          this.sendingUntil = 0;
+          break;
+        }
       }
+      await this.pushFullState();
     }
   }
   // Note: Media sending has been removed per user request.
@@ -5205,7 +5477,7 @@ var ChatController = class {
       await this.sendMessage(fallbackText);
       return;
     }
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M16";
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M298";
     const ok = await this.ls.sendCascadeItems(id, items, [], model);
     if (!ok) {
       await this.sendMessage(fallbackText);
@@ -5217,7 +5489,7 @@ var ChatController = class {
       this.lastStepSig = "";
       this.lastGenerating = true;
       this.lastStatusText = "Thinking";
-      this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
+      await this.pushFullState();
     }
   }
   // Invoke a system slash command (grill-me / goal / schedule / learn …). The
@@ -5265,23 +5537,31 @@ var ChatController = class {
       return;
     this.userSelected = true;
     this.pendingNewChat = false;
-    try {
-      await vscode.commands.executeCommand(
-        "workbench.action.smartFocusConversation",
-        id
-      );
-    } catch {
-      try {
-        await vscode.commands.executeCommand(
-          "workbench.action.forceFocusManager",
-          id
-        );
-      } catch {
-      }
-    }
     this.activeCascadeId = id;
     this.lastStepSig = "";
     this.lastCdpSig = "";
+    const candidates = [
+      "antigravity.openConversation",
+      "antigravity.focusConversation",
+      "antigravity.openCascade",
+      "antigravity.switchCascade",
+      "workbench.action.smartFocusConversation",
+      "workbench.action.forceFocusManager",
+      "windsurf.openCascade"
+    ];
+    for (const cmd of candidates) {
+      try {
+        await vscode.commands.executeCommand(cmd, id);
+        break;
+      } catch {
+      }
+    }
+    if (this.cdpConnected()) {
+      try {
+        await this.cdp.openConversation(id);
+      } catch {
+      }
+    }
     await this.pushFullState();
   }
   async cancel() {
@@ -5310,10 +5590,17 @@ var ChatController = class {
     if (!id || stepIndex == null || stepIndex < 0)
       return false;
     await this.cancel();
-    await delay(150);
+    await delay(100);
     const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.revertToStep(id, stepIndex, model);
-    await delay(300);
+    this.revertCheckpoints.set(id, stepIndex);
+    if (this.cdpConnected()) {
+      try {
+        await this.cdp.revertToStep(stepIndex);
+      } catch {
+      }
+    }
+    await delay(150);
     this.lastStepSig = "";
     await this.pushFullState();
     this.log(`[chat] revert to step ${stepIndex} -> ${ok ? "ok" : "failed"}`);
@@ -5356,69 +5643,172 @@ var ChatController = class {
     };
   }
   // Answer an ask_question interaction. `answers` maps question index → chosen
+  // Answer an ask_question interaction. `answers` maps question index → chosen
   // option ids (+ optional free text). We rebuild the full responses[] the LS
   // expects (echoing the questions/options) so the agent resumes.
   async answerQuestion(stepIndex, answers) {
+    const optIndices = [];
+    let customText = "";
+    for (const a of answers) {
+      if (Array.isArray(a.selectedOptionIds)) {
+        for (const idStr of a.selectedOptionIds) {
+          const n = parseInt(idStr, 10);
+          if (!isNaN(n) && n > 0)
+            optIndices.push(n - 1);
+        }
+      }
+      if (a.freeText)
+        customText = a.freeText;
+    }
+    const cdpOk = await this.cdp.answerQuestion({
+      optionIndices: optIndices,
+      freeText: customText
+    });
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
-      return false;
+      return cdpOk;
     const data = await this.ls.getTrajectory(id);
-    const trajectoryId = String(data?.trajectory?.trajectoryId ?? "");
     const steps = extractSteps(data);
-    let step = steps.find(
-      (s, idx) => s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex || s?.stepIndex === stepIndex || s?.step_index === stepIndex || idx === stepIndex
+    let step = steps.slice().reverse().find(
+      (s) => s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex || s?.stepIndex === stepIndex || s?.step_index === stepIndex
     );
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) => (s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" || s?.type === "ASK_QUESTION" || s?.type === "ASK_PERMISSION" || Boolean(s?.askQuestion) || Boolean(s?.requestedInteraction?.askQuestion)) && s?.status !== "CORTEX_STEP_STATUS_DONE" && s?.status !== "CORTEX_STEP_STATUS_COMPLETED"
+      );
+    }
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) => s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" || s?.type === "ASK_QUESTION" || s?.type === "ASK_PERMISSION" || Boolean(s?.askQuestion) || Boolean(s?.requestedInteraction?.askQuestion)
+      );
+    }
     if (!step && steps.length > 0)
       step = steps[steps.length - 1];
+    const trajectoryId = String(
+      step?.metadata?.sourceTrajectoryStepInfo?.trajectoryId || data?.trajectory?.trajectoryId || data?.trajectory?.metadata?.trajectoryId || id
+    );
     const realStepIndex = step?.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? step?.stepIndex ?? step?.step_index ?? stepIndex;
     const aq = step?.askQuestion ?? step?.requestedInteraction?.askQuestion ?? step?.askPermission;
-    const questions = Array.isArray(aq?.questions) ? aq.questions : [];
-    const responses = (questions.length > 0 ? questions : answers).map((q, i) => {
-      const a = answers[i] ?? { selectedOptionIds: [] };
-      const r = {
-        question: typeof q === "string" ? q : q?.question ?? "",
-        options: q?.options ?? []
-      };
-      if (Array.isArray(a.selectedOptionIds) && a.selectedOptionIds.length > 0) {
-        r.selectedOptionIds = a.selectedOptionIds;
+    const rawQList = parseAskQuestions(step);
+    const questions = Array.isArray(aq?.questions) && aq.questions.length > 0 ? aq.questions : rawQList;
+    const responses = (questions.length > 0 ? questions : answers).map(
+      (q, i) => {
+        const a = answers[i] ?? { selectedOptionIds: [] };
+        const rawOpts = q?.options ?? [];
+        const opts = Array.isArray(rawOpts) ? rawOpts.map((o, idx) => ({
+          id: String(o.id ?? idx + 1),
+          text: String(o.text ?? o)
+        })) : [];
+        const r = {
+          question: typeof q === "string" ? q : q?.question ?? "",
+          options: opts
+        };
+        if (Array.isArray(a.selectedOptionIds) && a.selectedOptionIds.length > 0) {
+          r.selectedOptionIds = a.selectedOptionIds.map(String);
+        }
+        if (a.freeText) {
+          r.writeInResponse = a.freeText;
+        }
+        return r;
       }
-      if (a.freeText) {
-        r.writeInResponse = a.freeText;
-      }
-      return r;
-    });
-    const ok = await this.ls.handleUserInteraction(id, trajectoryId, realStepIndex, responses);
+    );
+    const ok = await this.ls.handleUserInteraction(
+      id,
+      trajectoryId,
+      realStepIndex,
+      responses
+    );
     this.lastStepSig = "";
     await this.pushFullState();
-    this.log(`[chat] answer question step ${stepIndex} (real: ${realStepIndex}) -> ${ok ? "ok" : "failed"}`);
-    return ok;
+    this.log(
+      `[chat] answer question step ${stepIndex} (real: ${realStepIndex}) -> rpc: ${ok ? "ok" : "failed"}, cdp: ${cdpOk ? "ok" : "failed"}`
+    );
+    if (!ok && !cdpOk) {
+      const choiceTexts = [];
+      for (let i = 0; i < answers.length; i++) {
+        const a = answers[i];
+        if (a.freeText) {
+          choiceTexts.push(a.freeText);
+        } else if (Array.isArray(a.selectedOptionIds) && a.selectedOptionIds.length > 0) {
+          const q = questions[i];
+          const optTexts = a.selectedOptionIds.map((optId) => {
+            const idx = parseInt(optId, 10) - 1;
+            if (q && Array.isArray(q.options) && q.options[idx]) {
+              const o = q.options[idx];
+              return typeof o === "string" ? o : o.text || optId;
+            }
+            return `L\u1EF1a ch\u1ECDn ${optId}`;
+          });
+          choiceTexts.push(optTexts.join(", "));
+        }
+      }
+      if (choiceTexts.length > 0) {
+        await this.sendMessage(choiceTexts.join("; "));
+        return true;
+      }
+    }
+    return ok || cdpOk;
   }
   // Skip an ask_question interaction (equivalent to the IDE's "skip" — send
   // empty selections so the agent proceeds with its recommendation).
   async skipQuestion(stepIndex) {
+    const cdpOk = await this.cdp.answerQuestion({ isSkip: true });
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
-      return false;
+      return cdpOk;
     const data = await this.ls.getTrajectory(id);
-    const trajectoryId = String(data?.trajectory?.trajectoryId ?? "");
-    if (!trajectoryId)
-      return false;
     const steps = extractSteps(data);
-    const step = steps.find(
-      (s) => s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex
+    let step = steps.slice().reverse().find(
+      (s) => s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex || s?.stepIndex === stepIndex || s?.step_index === stepIndex
     );
-    const aq = step?.askQuestion ?? step?.requestedInteraction?.askQuestion;
-    const questions = Array.isArray(aq?.questions) ? aq.questions : [];
-    const responses = questions.map((q) => ({
-      question: q?.question ?? "",
-      options: q?.options ?? [],
-      selectedOptionIds: [],
-      skipped: true
-    }));
-    const ok = await this.ls.handleUserInteraction(id, trajectoryId, stepIndex, responses);
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) => (s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" || s?.type === "ASK_QUESTION" || s?.type === "ASK_PERMISSION" || Boolean(s?.askQuestion) || Boolean(s?.requestedInteraction?.askQuestion)) && s?.status !== "CORTEX_STEP_STATUS_DONE" && s?.status !== "CORTEX_STEP_STATUS_COMPLETED"
+      );
+    }
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) => s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" || s?.type === "ASK_QUESTION" || s?.type === "ASK_PERMISSION" || Boolean(s?.askQuestion) || Boolean(s?.requestedInteraction?.askQuestion)
+      );
+    }
+    if (!step && steps.length > 0)
+      step = steps[steps.length - 1];
+    const trajectoryId = String(
+      step?.metadata?.sourceTrajectoryStepInfo?.trajectoryId || data?.trajectory?.trajectoryId || data?.trajectory?.metadata?.trajectoryId || id
+    );
+    const realStepIndex = step?.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? step?.stepIndex ?? step?.step_index ?? stepIndex;
+    const aq = step?.askQuestion ?? step?.requestedInteraction?.askQuestion ?? step?.askPermission;
+    const rawQList = parseAskQuestions(step);
+    const questions = Array.isArray(aq?.questions) && aq.questions.length > 0 ? aq.questions : rawQList;
+    const responses = (questions.length > 0 ? questions : [{}]).map((q) => {
+      const rawOpts = q?.options ?? [];
+      const opts = Array.isArray(rawOpts) ? rawOpts.map((o, idx) => ({
+        id: String(o.id ?? idx + 1),
+        text: String(o.text ?? o)
+      })) : [];
+      return {
+        question: typeof q === "string" ? q : q?.question ?? "",
+        options: opts,
+        selectedOptionIds: [],
+        skipped: true
+      };
+    });
+    const ok = await this.ls.handleUserInteraction(
+      id,
+      trajectoryId,
+      realStepIndex,
+      responses
+    );
     this.lastStepSig = "";
     await this.pushFullState();
-    return ok;
+    this.log(
+      `[chat] skip question step ${stepIndex} (real: ${realStepIndex}) -> rpc: ${ok ? "ok" : "failed"}, cdp: ${cdpOk ? "ok" : "failed"}`
+    );
+    if (!ok && !cdpOk) {
+      await this.sendMessage("User Skipped");
+      return true;
+    }
+    return ok || cdpOk;
   }
   // Fetch the dynamic slash-command catalog for the active cascade.
   async getSlashCommands() {
@@ -5429,7 +5819,7 @@ var ChatController = class {
     const uris = data?.trajectory?.metadata?.workspaceUris ?? data?.trajectory?.metadata?.workspaces?.map(
       (w) => w?.workspaceFolderAbsoluteUri
     ).filter(Boolean) ?? [];
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M298";
     return this.ls.getSlashCommands(id, uris, model);
   }
   // Approve or reject a plan artifact (implementation_plan.md etc). The IDE
@@ -5438,7 +5828,7 @@ var ChatController = class {
     const id = this.activeCascadeId || await this.resolveActiveCascadeId();
     if (!id)
       return false;
-    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M36";
+    const model = this.selectedModelId || await this.detectActiveModel() || "MODEL_PLACEHOLDER_M298";
     const ok = await this.ls.approveArtifact(id, artifactUri, approved, model);
     this.lastStepSig = "";
     await this.pushFullState();
@@ -5498,15 +5888,24 @@ var ChatController = class {
         return this.selectedModelId && (this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label);
       });
       if (!this.selectedModelId || !hasSelected) {
-        const m36 = configs.find((c) => {
-          const mid = String(c?.modelOrAlias?.model ?? "");
-          const label = String(c?.label ?? "").toLowerCase();
-          return mid === "MODEL_PLACEHOLDER_M36" || label.includes("3.7") && label.includes("flash");
-        });
-        if (m36) {
-          this.selectedModelId = String(m36?.modelOrAlias?.model ?? m36?.modelOrAlias?.alias ?? m36?.label ?? "MODEL_PLACEHOLDER_M36");
-        } else {
-          this.selectedModelId = "MODEL_PLACEHOLDER_M36";
+        if (activeModel) {
+          const matched = configs.find((c) => {
+            const mid = String(c?.modelOrAlias?.model ?? "");
+            const alias = String(c?.modelOrAlias?.alias ?? "");
+            const label = String(c?.label ?? "");
+            return activeModel === mid || activeModel === alias || activeModel === label;
+          });
+          if (matched) {
+            this.selectedModelId = String(
+              matched?.modelOrAlias?.model ?? matched?.modelOrAlias?.alias ?? matched?.label ?? ""
+            );
+          }
+        }
+        if (!this.selectedModelId) {
+          const recModel = configs.find((c) => c?.isRecommended) || configs[0];
+          this.selectedModelId = String(
+            recModel?.modelOrAlias?.model ?? recModel?.modelOrAlias?.alias ?? recModel?.label ?? ""
+          );
         }
       }
       return configs.map((c) => {
@@ -5514,7 +5913,7 @@ var ChatController = class {
         const alias = String(c?.modelOrAlias?.alias ?? "");
         const label = String(c?.label ?? "");
         const id = mid || alias || label;
-        const isSel = this.selectedModelId ? this.selectedModelId === id || this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label : activeModel ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id : mid === "MODEL_PLACEHOLDER_M36" || Boolean(c?.isRecommended);
+        const isSel = this.selectedModelId ? this.selectedModelId === id || this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label : activeModel ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id : Boolean(c?.isRecommended);
         return {
           id,
           label: label || mid || alias,
@@ -5595,9 +5994,24 @@ var ChatController = class {
       this.pendingNewChat = false;
       this.activeCascadeId = cascadeId;
     }
+    if (this.pendingNewChat && !cascadeId) {
+      return { cascadeId: "", generating: false, statusText: "Idle", messages: [] };
+    }
     const id = cascadeId || this.activeCascadeId || await this.resolveActiveCascadeId();
     const data = id ? await this.ls.getTrajectory(id) : null;
-    const steps = extractSteps(data);
+    let steps = extractSteps(data);
+    const revertTarget = id ? this.revertCheckpoints.get(id) : void 0;
+    if (typeof revertTarget === "number") {
+      const trimmed = [];
+      for (const s of steps) {
+        const sIdx = s.stepIndex ?? s.step_index ?? s.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+        if (typeof sIdx === "number" && sIdx > revertTarget) {
+          break;
+        }
+        trimmed.push(s);
+      }
+      steps = trimmed;
+    }
     const trajectoryStatus = data?.trajectory?.status ?? data?.status;
     const generating = isGenerating(steps, trajectoryStatus);
     const statusText = describeStatus(steps, generating);
@@ -5679,7 +6093,13 @@ var ChatController = class {
     const statusText = describeStatus(steps, generating);
     accumulateStatsFromSteps(id, steps, (s) => this.emit({ type: "stats_update", stats: s }));
     let effectiveGenerating = generating;
-    if (generating) {
+    if (this.sendingUntil && Date.now() < this.sendingUntil) {
+      if (!generating) {
+        effectiveGenerating = true;
+      } else {
+        this.sendingUntil = 0;
+      }
+    } else if (generating) {
       if (this.generatingTimeout) {
         clearTimeout(this.generatingTimeout);
         this.generatingTimeout = null;
@@ -5764,6 +6184,25 @@ function stepDurationMs(step) {
   const ms = end - start;
   return ms > 0 ? ms : null;
 }
+function stepTimestamp(step) {
+  const m = step?.metadata;
+  const raw = m?.completedAt || m?.startedAt || m?.createdAt || m?.timestamp || step?.completedAt || step?.startedAt || step?.createdAt || step?.timestamp;
+  if (!raw)
+    return void 0;
+  if (typeof raw === "number") {
+    return raw < 1e11 ? raw * 1e3 : raw;
+  }
+  if (typeof raw === "string") {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed) && parsed > 0)
+      return parsed;
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > 0) {
+      return num < 1e11 ? num * 1e3 : num;
+    }
+  }
+  return void 0;
+}
 function diffStats(step) {
   const lines = step?.codeAction?.actionResult?.edit?.diff?.unifiedDiff?.lines;
   if (!Array.isArray(lines))
@@ -5799,6 +6238,17 @@ function toolInfo(step) {
       return { kind: "edit", verb: "Edited", detail: baseName(args.AbsolutePath || args.TargetFile || args?.ArtifactMetadata?.Summary || "") };
     case "MANAGE_TASK":
       return { kind: "task", verb: "Task", detail: String(args.toolSummary || "").slice(0, 60) };
+    case "BROWSER_SUBAGENT":
+    case "BROWSER":
+    case "OPEN_BROWSER_URL":
+    case "READ_BROWSER_PAGE":
+      return { kind: "browser", verb: "Browser", detail: String(args.TaskName || args.TaskSummary || args.Url || args.toolSummary || "").slice(0, 70) };
+    case "SEARCH_WEB":
+      return { kind: "search", verb: "Search Web", detail: String(args.query || args.Query || "").slice(0, 60) };
+    case "READ_URL_CONTENT":
+      return { kind: "read", verb: "Read URL", detail: String(args.Url || args.url || "").slice(0, 70) };
+    case "GENERATE_IMAGE":
+      return { kind: "edit", verb: "Generate Image", detail: String(args.Prompt || args.ImageName || "").slice(0, 60) };
     default: {
       const summary = args.toolSummary || args.toolAction || "";
       return { kind: "tool", verb: summary ? String(summary) : titleCase(type), detail: "" };
@@ -5824,15 +6274,25 @@ function describeStatus(steps, generating) {
 }
 function isPlanStep(step) {
   const args = toolArgs(step);
+  const targetFile = String(
+    args.TargetFile || args.AbsolutePath || step?.codeAction?.actionSpec?.createFile?.path?.absoluteUri || ""
+  );
+  const base = baseName(targetFile).toLowerCase();
+  if (!base || base.includes("walkthrough") || base.includes("task") || base.includes("scratch") || base.endsWith(".ts") || base.endsWith(".tsx") || base.endsWith(".js") || base.endsWith(".jsx") || base.endsWith(".css") || base.endsWith(".html") || base.endsWith(".json")) {
+    return false;
+  }
+  const isStrictPlanFile = base === "implementation_plan.md" || base === "implementation_plan" || base === "plan.md" || targetFile.toLowerCase().endsWith("/implementation_plan.md") || targetFile.toLowerCase().endsWith("/plan.md");
+  if (!isStrictPlanFile)
+    return false;
   const meta = args?.ArtifactMetadata;
-  return Boolean(meta && (meta.RequestFeedback || meta.UserFacing) && /plan/i.test(String(meta.Summary || "")));
+  return meta?.RequestFeedback === true || meta?.RequestFeedback === "true";
 }
 function stepDetailText(step) {
   const type = shortType(step?.type ?? "");
   const args = toolArgs(step);
   let rawContent = typeof step?.content === "string" ? step.content.trim() : "";
-  if (rawContent.length > 25e3) {
-    rawContent = rawContent.slice(0, 1e4) + "\n\n...[TRUNCATED_BY_ANTIGRAVITY_REMOTE]...\n\n" + rawContent.slice(-1e4);
+  if (rawContent.length > 35e3) {
+    rawContent = rawContent.slice(0, 15e3) + "\n\n...[TRUNCATED_BY_ANTIGRAVITY_REMOTE]...\n\n" + rawContent.slice(-15e3);
   }
   if (type === "RUN_COMMAND") {
     const cmd = args.CommandLine || "";
@@ -5844,21 +6304,45 @@ ${rawContent}` : rawContent;
     }
     return text || void 0;
   }
+  if (type === "WRITE_TO_FILE") {
+    const file = args.TargetFile || args.AbsolutePath || "";
+    const desc2 = args.Description || "";
+    const code = args.CodeContent || "";
+    let text = file ? `Target: ${file}` : "";
+    if (desc2)
+      text += (text ? `
+Description: ` : "") + desc2;
+    if (code)
+      text += (text ? `
+
+` : "") + code;
+    if (rawContent)
+      text += (text ? `
+
+` : "") + rawContent;
+    return text || void 0;
+  }
   if (type === "CODE_ACTION" || type === "REPLACE_FILE_CONTENT" || type === "MULTI_REPLACE_FILE_CONTENT") {
+    const file = args.TargetFile || args.AbsolutePath || "";
     const desc2 = args.Description || args.Instruction || "";
     let target = args.TargetContent || "";
     let replacement = args.ReplacementContent || "";
-    if (target.length > 5e3)
-      target = target.slice(0, 5e3) + "\n...[TRUNCATED]";
-    if (replacement.length > 5e3)
-      replacement = replacement.slice(0, 5e3) + "\n...[TRUNCATED]";
-    let text = desc2 ? `Description: ${desc2}` : "";
+    if (target.length > 8e3)
+      target = target.slice(0, 8e3) + "\n...[TRUNCATED]";
+    if (replacement.length > 8e3)
+      replacement = replacement.slice(0, 8e3) + "\n...[TRUNCATED]";
+    let text = file ? `File: ${file}
+` : "";
+    if (desc2)
+      text += `Description: ${desc2}
+`;
     if (target || replacement) {
       if (text)
-        text += "\n\n";
+        text += "\n";
       if (target)
         text += `--- Target:
 ${target}
+
 `;
       if (replacement)
         text += `+++ Replacement:
@@ -5893,6 +6377,40 @@ ${rawContent}`;
 ${rawContent}`;
     return text;
   }
+  if (type === "LIST_DIRECTORY") {
+    const dir = args.DirectoryPath || args.Path || "";
+    let text = `Directory: ${dir}`;
+    if (rawContent)
+      text += `
+
+${rawContent}`;
+    return text;
+  }
+  if (type === "BROWSER_SUBAGENT" || type === "BROWSER" || type === "OPEN_BROWSER_URL" || type === "READ_BROWSER_PAGE") {
+    const taskName = args.TaskName || "";
+    const task = args.Task || "";
+    const taskSummary = args.TaskSummary || "";
+    const url = args.Url || args.url || "";
+    let text = taskName ? `Task: ${taskName}
+` : "";
+    if (taskSummary)
+      text += `Summary: ${taskSummary}
+`;
+    if (url)
+      text += `URL: ${url}
+`;
+    if (task)
+      text += `
+Instructions:
+${task}
+`;
+    if (rawContent)
+      text += (text ? `
+
+Result:
+` : "") + rawContent;
+    return text || void 0;
+  }
   if (rawContent)
     return rawContent;
   const desc = args.Description || args.Instruction || args.toolSummary || args.toolAction;
@@ -5924,22 +6442,255 @@ function stepTokenCount(step) {
   const typeLen = String(step?.type || "").length;
   return 18 + typeLen * 9 % 27;
 }
+function parseAskQuestions(step, tc) {
+  let rawArgs = {};
+  if (tc) {
+    if (typeof tc.argumentsJson === "string") {
+      try {
+        rawArgs = JSON.parse(tc.argumentsJson);
+      } catch {
+        rawArgs = {};
+      }
+    } else {
+      rawArgs = tc.args || {};
+    }
+  } else {
+    rawArgs = toolArgs(step);
+  }
+  const ri = step?.requestedInteraction || step?.permissionRequest || step?.requestedPermission || step?.toolPermissionRequest || {};
+  const aq = step?.askQuestion || ri?.askQuestion || step?.askPermission || ri?.askPermission || step?.permissionRequest || step?.requestedPermission || step?.toolPermissionRequest || ri?.toolPermissionRequest || ri?.permissionRequest || ri || {};
+  let rawQList = rawArgs.questions || aq.questions || ri.questions || step?.questions;
+  if (typeof rawQList === "string") {
+    try {
+      rawQList = JSON.parse(rawQList);
+    } catch {
+    }
+  }
+  if (Array.isArray(rawQList) && rawQList.length > 0) {
+    return rawQList.map((q, qIdx) => {
+      if (typeof q === "string") {
+        return {
+          question: q,
+          description: "",
+          options: [
+            { id: "1", text: "Yes" },
+            { id: "2", text: "No" }
+          ]
+        };
+      }
+      const qText = String(
+        q.question || q.title || q.Reason || q.reason || `C\xE2u h\u1ECFi ${qIdx + 1}`
+      ).trim();
+      const desc = q.description || q.toolAction || q.toolSummary || q.targetPath || q.path || "";
+      let opts = q.options;
+      if (typeof opts === "string") {
+        try {
+          opts = JSON.parse(opts);
+        } catch {
+        }
+      }
+      const parsedOptions = Array.isArray(opts) ? opts.map(
+        (o, idx) => typeof o === "string" ? { id: String(idx + 1), text: o } : { id: String(o.id ?? idx + 1), text: String(o.text ?? o) }
+      ) : [
+        { id: "1", text: "Yes, allow this time" },
+        { id: "2", text: "Yes, and always allow" },
+        { id: "3", text: "No (tell the agent what to do instead)" }
+      ];
+      return {
+        question: qText,
+        description: desc,
+        options: parsedOptions,
+        is_multi_select: Boolean(q.is_multi_select || q.isMultiSelect)
+      };
+    });
+  }
+  const singleQ = rawArgs.question || aq.question || aq.title || rawArgs.Reason || aq.reason;
+  if (singleQ) {
+    let opts = rawArgs.options || aq.options;
+    if (typeof opts === "string") {
+      try {
+        opts = JSON.parse(opts);
+      } catch {
+      }
+    }
+    const parsedOptions = Array.isArray(opts) ? opts.map(
+      (o, idx) => typeof o === "string" ? { id: String(idx + 1), text: o } : { id: String(o.id ?? idx + 1), text: String(o.text ?? o) }
+    ) : [
+      { id: "1", text: "Yes, allow this time" },
+      { id: "2", text: "Yes, and always allow" },
+      { id: "3", text: "No (tell the agent what to do instead)" }
+    ];
+    return [
+      {
+        question: String(singleQ),
+        description: rawArgs.description || rawArgs.toolAction || rawArgs.toolSummary || rawArgs.targetPath || "",
+        options: parsedOptions,
+        is_multi_select: Boolean(rawArgs.is_multi_select || rawArgs.isMultiSelect)
+      }
+    ];
+  }
+  let targetPath = "";
+  const scanObj = (o, depth = 0) => {
+    if (!o || typeof o !== "object" || depth > 5)
+      return;
+    if (!targetPath) {
+      const found = o.targetPath || o.target || o.path || o.resource || o.file || o.filePath || o.Target || o.TargetFile || o.Path || o.Resource || o.uri || "";
+      if (found && typeof found === "string" && found.length > 1) {
+        targetPath = found;
+        return;
+      }
+    }
+    for (const k of Object.keys(o)) {
+      if (o[k] && typeof o[k] === "object" && k !== "options" && k !== "questions" && k !== "plannerResponse") {
+        scanObj(o[k], depth + 1);
+        if (targetPath)
+          return;
+      }
+    }
+  };
+  scanObj(step);
+  if (!targetPath && tc)
+    scanObj(rawArgs);
+  const actionType = rawArgs.Action || rawArgs.action || ri.permissionType || ri.action || aq.action || aq.permissionType || "read access";
+  const reasonText = targetPath ? `C\u1EA5p quy\u1EC1n truy c\u1EADp cho t\u1EC7p tin / th\u01B0 m\u1EE5c:` : `Allow ${actionType} to this path?`;
+  return [
+    {
+      question: reasonText,
+      description: targetPath,
+      options: [
+        { id: "1", text: "Yes, allow this time" },
+        { id: "2", text: "Yes, and always allow" },
+        { id: "3", text: "No (tell the agent what to do instead)" }
+      ]
+    }
+  ];
+}
+function isErrorLikeJson(text) {
+  if (!text)
+    return false;
+  const t = text.trim();
+  if (t.startsWith("{") && t.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(t);
+      if (parsed.error || parsed.errorMessage || parsed.userErrorMessage || parsed.user_error_message || parsed.code === 429 || parsed.status === "RESOURCE_EXHAUSTED" || parsed.status === "ERROR") {
+        return true;
+      }
+    } catch {
+    }
+  }
+  return false;
+}
+function extractErrorString(step) {
+  if (!step)
+    return "\u0110\xE3 x\u1EA3y ra l\u1ED7i khi th\u1EF1c thi.";
+  let errId = step.errorId || step.error_id || step.error?.errorId || step.error?.error_id || step.error?.id || step.id || "";
+  const queue = [
+    step.error?.userErrorMessage,
+    step.error?.user_error_message,
+    step.userErrorMessage,
+    step.user_error_message,
+    step.errorMessage,
+    step.error_message,
+    step.error?.message,
+    step.error?.description,
+    step.error?.error?.message,
+    step.error?.error?.userErrorMessage,
+    step.error?.details,
+    step.systemMessage?.message,
+    step.systemMessage?.renderInfo?.description,
+    step.systemMessage?.renderInfo?.title,
+    step.failureReason,
+    step.error,
+    step.content
+  ];
+  let rawMessage = "";
+  for (const item of queue) {
+    if (!item)
+      continue;
+    if (typeof item === "string" && item.trim()) {
+      const s = item.trim();
+      if (s.startsWith("{") && s.endsWith("}")) {
+        try {
+          const parsed = JSON.parse(s);
+          const msg = parsed.userErrorMessage || parsed.user_error_message || parsed.error?.userErrorMessage || parsed.error?.message || parsed.message || parsed.description;
+          if (msg) {
+            rawMessage = String(msg).trim();
+            if (parsed.errorId || parsed.id || parsed.error?.id) {
+              errId = parsed.errorId || parsed.id || parsed.error?.id;
+            }
+            break;
+          }
+        } catch {
+        }
+      }
+      rawMessage = s;
+      break;
+    }
+    if (typeof item === "object") {
+      const msg = item.userErrorMessage || item.user_error_message || item.error?.userErrorMessage || item.error?.message || item.message || item.description || item.title;
+      if (typeof msg === "string" && msg.trim()) {
+        rawMessage = msg.trim();
+        if (item.errorId || item.id || item.error_id || item.error?.id) {
+          errId = item.errorId || item.id || item.error_id || item.error?.id;
+        }
+        break;
+      }
+    }
+  }
+  if (!rawMessage || rawMessage === "[object Object]") {
+    rawMessage = "\u0110\xE3 x\u1EA3y ra l\u1ED7i khi th\u1EF1c thi t\xE1c v\u1EE5.";
+  }
+  if (rawMessage.startsWith("{") && rawMessage.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(rawMessage);
+      const msg = parsed.userErrorMessage || parsed.user_error_message || parsed.error?.userErrorMessage || parsed.error?.message || parsed.message || parsed.description;
+      if (msg)
+        rawMessage = String(msg).trim();
+      if (parsed.errorId || parsed.id || parsed.error?.id) {
+        errId = parsed.errorId || parsed.id || parsed.error?.id;
+      }
+    } catch {
+    }
+  }
+  rawMessage = rawMessage.replace(/^Error:\s*/i, "").trim();
+  let formatted = rawMessage;
+  if (errId && !formatted.includes(String(errId))) {
+    formatted += `
+
+**Error ID:** \`${errId}\``;
+  }
+  return formatted;
+}
 function stepsToMessages(steps, cascadeId) {
   const msgs = [];
   const answeredArtifacts = /* @__PURE__ */ new Set();
-  for (const step of steps) {
+  const validSteps = steps.filter((step) => {
+    if (!step)
+      return false;
+    if (step.metadata?.isReverted || step.metadata?.deleted || step.metadata?.undone || step.isDeleted || step.reverted || step.undone) {
+      return false;
+    }
+    const status = String(step.status ?? "").toUpperCase();
+    if (status === "REVERTED" || status === "DELETED" || status === "UNDONE") {
+      return false;
+    }
+    return true;
+  });
+  for (const step of validSteps) {
     const comments = step?.userInput?.artifactComments ?? step?.artifactComments ?? null;
     if (Array.isArray(comments)) {
       for (const c of comments) {
         const uri = String(c?.artifactUri ?? "");
-        if (uri && c?.approvalStatus)
+        if (uri && c?.approvalStatus) {
           answeredArtifacts.add(uri);
+          answeredArtifacts.add(baseName(uri));
+        }
       }
     }
   }
   let turnTokens = 0;
   let turnDurationMs = 0;
-  for (const step of steps) {
+  for (const step of validSteps) {
     const type = shortType(step.type);
     const durationMs = stepDurationMs(step);
     const stepTok = stepTokenCount(step);
@@ -5948,6 +6699,7 @@ function stepsToMessages(steps, cascadeId) {
       turnDurationMs += durationMs;
     if (stepTok != null && stepTok > 0)
       turnTokens += stepTok;
+    const stepTs = stepTimestamp(step);
     if (type === "USER_INPUT") {
       turnTokens = 0;
       turnDurationMs = 0;
@@ -5983,6 +6735,7 @@ function stepsToMessages(steps, cascadeId) {
         msgs.push({
           role: "user",
           text: t,
+          ts: stepTs,
           images: images.length > 0 ? images : void 0,
           stepIndex: typeof stepIndex === "number" ? stepIndex : void 0
         });
@@ -5991,9 +6744,31 @@ function stepsToMessages(steps, cascadeId) {
     if (type === "PLANNER_RESPONSE") {
       const resp = String(step.plannerResponse?.response ?? "").trim();
       if (resp) {
+        if (isErrorLikeJson(resp)) {
+          const cleanErr = extractErrorString({ ...step, errorMessage: resp });
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.kind === "error" && lastMsg.text === cleanErr) {
+            continue;
+          }
+          msgs.push({
+            role: "assistant",
+            text: cleanErr,
+            kind: "error",
+            ts: stepTs,
+            meta: {
+              type,
+              isError: true,
+              tokens: stepTok ?? void 0,
+              turnTokens: turnTokens > 0 ? turnTokens : void 0,
+              turnDurationMs: turnDurationMs > 0 ? turnDurationMs : void 0
+            }
+          });
+          continue;
+        }
         msgs.push({
           role: "assistant",
           text: resp,
+          ts: stepTs,
           meta: {
             type,
             tokens: stepTok ?? void 0,
@@ -6002,139 +6777,63 @@ function stepsToMessages(steps, cascadeId) {
           }
         });
       }
-      const calls = step.plannerResponse?.toolCalls;
-      if (Array.isArray(calls)) {
-        for (const tc of calls) {
-          const toolName = String(tc?.name || "").toLowerCase();
-          if (toolName === "ask_permission" || toolName === "ask_question") {
-            try {
-              const args = typeof tc?.argumentsJson === "string" ? JSON.parse(tc.argumentsJson) : tc?.args || {};
-              const targetPath = args.Target || args.path || args.target || args.AbsolutePath || "";
-              const actionType = args.Action || args.action || "read access";
-              const questions = [{
-                question: args.question || args.Reason || `Allow ${actionType} to this path?`,
-                description: targetPath,
-                options: Array.isArray(args.options) ? args.options.map((o, idx) => typeof o === "string" ? { id: String(idx + 1), text: o } : o) : [
-                  { id: "1", text: "Yes, allow this time" },
-                  { id: "2", text: "Yes, and always allow" },
-                  { id: "3", text: "No (tell the agent what to do instead)" }
-                ]
-              }];
-              const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? step.stepIndex ?? step.step_index;
-              msgs.push({
-                role: "ask",
-                text: questions.map((q) => String(q?.question ?? "")).join("\n"),
-                stepIndex: typeof stepIndex === "number" ? stepIndex : void 0,
-                meta: {
-                  type: "ASK_PERMISSION",
-                  questions,
-                  answered: false,
-                  selected: []
-                }
-              });
-              continue;
-            } catch {
-            }
-          }
-          const fakeStep = {
-            type: `CORTEX_STEP_TYPE_${String(tc?.name || "").toUpperCase()}`,
-            plannerResponse: { toolCalls: [tc] }
-          };
-          const info2 = toolInfo(fakeStep);
-          const callOut = stepDetailText(fakeStep) || JSON.stringify(tc?.argumentsJson ? JSON.parse(tc.argumentsJson) : {}, null, 2);
-          msgs.push({
-            role: "tool",
-            text: `${info2.verb}${info2.detail ? " " + info2.detail : ""}`,
-            kind: info2.kind,
-            detail: info2.detail,
-            meta: {
-              type,
-              output: callOut,
-              ...stepTok != null ? { tokens: stepTok } : {}
-            }
-          });
-        }
-      }
       continue;
     }
-    if (type === "SYSTEM_MESSAGE" || type === "ERROR_MESSAGE") {
+    const isError = type === "ERROR_MESSAGE" || type === "FAILURE" || String(step.status ?? "").toUpperCase() === "ERROR" || String(step.status ?? "").toUpperCase() === "FAILED" || Boolean(step.errorMessage) || Boolean(step.error);
+    if (isError && type !== "USER_INPUT") {
+      const errText = extractErrorString(step);
+      if (errText) {
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg && lastMsg.kind === "error" && lastMsg.text === errText) {
+          continue;
+        }
+        msgs.push({
+          role: "assistant",
+          text: errText,
+          kind: "error",
+          ts: stepTs,
+          meta: { type: "ERROR_MESSAGE", isError: true, output: stepOut || void 0 }
+        });
+        continue;
+      }
+    }
+    if (type === "SYSTEM_MESSAGE") {
       const t = String(
         step.systemMessage?.message ?? step.systemMessage?.renderInfo?.title ?? ""
       ).trim();
-      if (t)
-        msgs.push({ role: "system", text: t, kind: type === "ERROR_MESSAGE" ? "error" : "system", meta: { type } });
+      if (t) {
+        if (isErrorLikeJson(t)) {
+          const cleanErr = extractErrorString({ ...step, errorMessage: t });
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.kind === "error" && lastMsg.text === cleanErr) {
+            continue;
+          }
+          msgs.push({
+            role: "assistant",
+            text: cleanErr,
+            kind: "error",
+            ts: stepTs,
+            meta: { type, isError: true }
+          });
+          continue;
+        }
+        msgs.push({
+          role: "system",
+          text: t,
+          kind: "system",
+          ts: stepTs,
+          meta: { type }
+        });
+      }
       continue;
     }
     const isAskStep = type === "ASK_QUESTION" || type === "ASK_PERMISSION" || type === "REQUESTED_INTERACTION" || type === "PERMISSION_REQUEST" || type === "TOOL_PERMISSION_REQUEST" || Boolean(step.askQuestion) || Boolean(step.askPermission) || Boolean(step.requestedInteraction) || Boolean(step.permissionRequest) || Boolean(step.requestedPermission) || Boolean(step.toolPermissionRequest);
     if (isAskStep) {
       const lastMsg = msgs[msgs.length - 1];
-      const ri = step.requestedInteraction || step.permissionRequest || step.requestedPermission || step.toolPermissionRequest || {};
-      const aq = step.askQuestion || ri.askQuestion || step.askPermission || ri.askPermission || step.permissionRequest || step.requestedPermission || step.toolPermissionRequest || ri.toolPermissionRequest || ri.permissionRequest || ri;
-      let targetPath = "";
-      const scanObj = (o, depth = 0) => {
-        if (!o || typeof o !== "object" || depth > 5)
-          return;
-        if (!targetPath) {
-          const found = o.targetPath || o.target || o.path || o.resource || o.file || o.filePath || o.Target || o.TargetFile || o.Path || o.Resource || o.uri || "";
-          if (found && typeof found === "string" && found.length > 1) {
-            targetPath = found;
-            return;
-          }
-        }
-        for (const k of Object.keys(o)) {
-          if (o[k] && typeof o[k] === "object" && k !== "options" && k !== "questions" && k !== "plannerResponse") {
-            scanObj(o[k], depth + 1);
-            if (targetPath)
-              return;
-          }
-        }
-      };
-      scanObj(step);
-      let actionType = ri.permissionType || ri.action || aq.action || aq.permissionType || "read access";
-      let reasonText = aq.reason || aq.question || aq.title || ri.reason || "";
-      if (!targetPath && (!reasonText || reasonText.toLowerCase().includes("allow read access")) && lastMsg && lastMsg.role === "ask") {
+      const questions = parseAskQuestions(step);
+      const qFirst = String(questions[0]?.question || "");
+      if (qFirst.toLowerCase().includes("allow read access") && lastMsg && lastMsg.role === "ask") {
         continue;
-      }
-      if (!reasonText) {
-        reasonText = targetPath ? `C\u1EA5p quy\u1EC1n truy c\u1EADp cho t\u1EC7p tin / th\u01B0 m\u1EE5c:` : `Allow ${actionType} to this path?`;
-      }
-      let questions = [];
-      if (Array.isArray(aq?.questions) && aq.questions.length > 0) {
-        questions = aq.questions.map((q) => ({
-          ...q,
-          description: q.description || q.targetPath || q.target || q.path || targetPath
-        }));
-      } else {
-        questions = [{
-          question: reasonText,
-          description: targetPath,
-          options: [
-            { id: "1", text: "Yes, allow this time" },
-            { id: "2", text: "Yes, and always allow" },
-            { id: "3", text: "No (tell the agent what to do instead)" }
-          ]
-        }];
-      }
-      if (questions.length === 0 && step.plannerResponse?.toolCalls) {
-        for (const tc of step.plannerResponse.toolCalls) {
-          if (tc.name === "ask_permission" || tc.name === "ask_question") {
-            try {
-              const args = tc.argumentsJson ? JSON.parse(tc.argumentsJson) : tc.args || {};
-              const targetPath2 = args.Target || args.path || args.target || "";
-              const actionType2 = args.Action || args.action || "read access";
-              questions = [{
-                question: args.question || args.Reason || `Allow ${actionType2} to this path?`,
-                description: targetPath2,
-                options: Array.isArray(args.options) ? args.options.map((o, idx) => typeof o === "string" ? { id: String(idx + 1), text: o } : o) : [
-                  { id: "1", text: "Yes, allow this time" },
-                  { id: "2", text: "Yes, and always allow" },
-                  { id: "3", text: "No (tell the agent what to do instead)" }
-                ]
-              }];
-            } catch {
-            }
-          }
-        }
       }
       if (questions.length > 0) {
         const answered = Array.isArray(step.completedInteractions) && step.completedInteractions.length > 0 ? true : questions.some(
@@ -6149,6 +6848,7 @@ function stepsToMessages(steps, cascadeId) {
         msgs.push({
           role: "ask",
           text: questions.map((q) => String(q?.question ?? "")).join("\n"),
+          ts: stepTs,
           stepIndex: typeof stepIndex === "number" ? stepIndex : void 0,
           meta: {
             type,
@@ -6163,18 +6863,22 @@ function stepsToMessages(steps, cascadeId) {
     if (type === "CHECKPOINT" || type === "EPHEMERAL_MESSAGE" || type === "CONVERSATION_HISTORY" || type === "KNOWLEDGE_ARTIFACTS" || type === "USER_INPUT") {
       continue;
     }
-    if (type === "CODE_ACTION" && isPlanStep(step)) {
+    if ((type === "CODE_ACTION" || type === "WRITE_TO_FILE") && isPlanStep(step)) {
       const args = toolArgs(step);
       const spec = step?.codeAction?.actionSpec?.createFile;
+      const targetFile = String(
+        args.TargetFile || args.AbsolutePath || spec?.path?.absoluteUri || ""
+      );
       const body = String(
-        spec?.instruction || args.CodeContent || args?.ArtifactMetadata?.Summary || ""
+        args.CodeContent || spec?.instruction || args?.ArtifactMetadata?.Summary || step.content || ""
       ).trim();
-      const artifactUri = String(spec?.path?.absoluteUri ?? "");
-      const answered = artifactUri && answeredArtifacts.has(artifactUri) || Array.isArray(step?.completedInteractions) && step.completedInteractions.length > 0;
+      const artifactUri = targetFile.startsWith("file://") ? targetFile : targetFile ? `file://${targetFile}` : "";
+      const answered = artifactUri && (answeredArtifacts.has(artifactUri) || answeredArtifacts.has(baseName(artifactUri))) || Array.isArray(step?.completedInteractions) && step.completedInteractions.length > 0;
       if (body) {
         msgs.push({
           role: "plan",
           text: body,
+          ts: stepTs,
           meta: { type, artifactUri, answered }
         });
         continue;
@@ -6188,6 +6892,7 @@ function stepsToMessages(steps, cascadeId) {
         msgs.push({
           role: "artifact",
           text: name,
+          ts: stepTs,
           meta: { type, artifactUri: uri }
         });
         continue;
@@ -6204,6 +6909,7 @@ function stepsToMessages(steps, cascadeId) {
         text: `${info.verb}${info.detail ? " " + info.detail : ""}`,
         kind: info.kind,
         detail: stepOut || info.detail,
+        ts: stepTs,
         meta: {
           type,
           ...durationMs != null ? { durationMs } : {},
@@ -6215,7 +6921,18 @@ function stepsToMessages(steps, cascadeId) {
       });
     }
   }
-  return msgs;
+  const finalMsgs = [];
+  for (const m of msgs) {
+    const prev = finalMsgs[finalMsgs.length - 1];
+    if (prev && m.kind === "error" && prev.kind === "error") {
+      if ((!prev.text || prev.text.length < m.text.length) && m.text) {
+        finalMsgs[finalMsgs.length - 1] = m;
+      }
+      continue;
+    }
+    finalMsgs.push(m);
+  }
+  return finalMsgs;
 }
 function titleCase(s) {
   return s.toLowerCase().replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -6356,6 +7073,7 @@ var EDITABLE_KEYS = [
   "telegramEnabled",
   "telegramToken",
   "telegramChatId",
+  "telegramNotifyOnComplete",
   "workspaceRoot"
 ];
 function cockpitDir() {
@@ -6409,6 +7127,21 @@ var SettingsController = {
         lastUsed: numOr2(a?.last_used) || void 0,
         quota
       };
+    });
+    const isProTier = (tier) => {
+      if (!tier)
+        return false;
+      const t = tier.toUpperCase();
+      return t.includes("PRO") || t.includes("PLUS") || t.includes("ULTRA") || t.includes("PREMIUM") || t.includes("PAID") || t.includes("ENTERPRISE") || t.includes("ADVANCED");
+    };
+    accounts.sort((a, b) => {
+      const aPro = isProTier(a.tier);
+      const bPro = isProTier(b.tier);
+      if (aPro !== bPro)
+        return aPro ? -1 : 1;
+      if (a.current !== b.current)
+        return a.current ? -1 : 1;
+      return (a.name || a.email).localeCompare(b.name || b.email);
     });
     return { currentEmail, accounts };
   },
@@ -6539,6 +7272,7 @@ var SettingsController = {
       telegramEnabled: c.get("telegramEnabled", false),
       telegramToken: c.get("telegramToken", ""),
       telegramChatId: c.get("telegramChatId", ""),
+      telegramNotifyOnComplete: c.get("telegramNotifyOnComplete", true),
       workspaceRoot: c.get("workspaceRoot", "")
     };
   },
@@ -6843,6 +7577,71 @@ var FileController = {
       (a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1
     );
     return out;
+  },
+  searchFiles(query = "", limit = 60) {
+    const root = workspaceRoot();
+    if (!root || !fs5.existsSync(root))
+      return [];
+    const q = query.trim().toLowerCase();
+    const results = [];
+    const IGNORE_DIRS = /* @__PURE__ */ new Set([
+      ".git",
+      "node_modules",
+      ".next",
+      "dist",
+      "out",
+      ".gemini",
+      "build",
+      ".vscode",
+      ".idea"
+    ]);
+    const walk = (dir, currentDepth) => {
+      if (results.length >= limit || currentDepth > 8)
+        return;
+      let entries = [];
+      try {
+        entries = fs5.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (results.length >= limit)
+          break;
+        if (IGNORE_DIRS.has(entry.name))
+          continue;
+        const fullPath = path4.join(dir, entry.name);
+        const relPath = path4.relative(root, fullPath).split(path4.sep).join("/");
+        const matches = !q || entry.name.toLowerCase().includes(q) || relPath.toLowerCase().includes(q);
+        if (entry.isDirectory()) {
+          if (matches) {
+            results.push({ name: entry.name, path: relPath, type: "dir" });
+          }
+          walk(fullPath, currentDepth + 1);
+        } else if (entry.isFile()) {
+          if (matches) {
+            let size = 0;
+            try {
+              size = fs5.statSync(fullPath).size;
+            } catch {
+            }
+            results.push({ name: entry.name, path: relPath, type: "file", size });
+          }
+        }
+      }
+    };
+    walk(root, 0);
+    results.sort((a, b) => {
+      const aExact = a.name.toLowerCase() === q;
+      const bExact = b.name.toLowerCase() === q;
+      if (aExact && !bExact)
+        return -1;
+      if (!aExact && bExact)
+        return 1;
+      if (a.type === b.type)
+        return a.path.localeCompare(b.path);
+      return a.type === "dir" ? -1 : 1;
+    });
+    return results.slice(0, limit);
   },
   read(rel) {
     const abs = resolveSafe(rel);
@@ -7322,6 +8121,11 @@ var WindowManager = class {
         return {
           root: FileController.root(),
           entries: FileController.list(payload.path ?? "")
+        };
+      case "files-search":
+        return {
+          root: FileController.root(),
+          entries: FileController.searchFiles(String(payload.query ?? ""), Number(payload.limit || 60))
         };
       case "file-read":
         return FileController.read(payload.path ?? "");
@@ -7808,6 +8612,11 @@ var RemoteServer = class {
         const rel = url.searchParams.get("path") ?? "";
         return rpc("files", { path: rel });
       }
+      case "files-search": {
+        const q = url.searchParams.get("q") ?? url.searchParams.get("query") ?? "";
+        const limit = parseInt(url.searchParams.get("limit") || "60", 10);
+        return rpc("files-search", { query: q, limit });
+      }
       case "file": {
         if (req.method === "GET") {
           const rel = url.searchParams.get("path") ?? "";
@@ -8179,9 +8988,12 @@ var TelegramBridge = class {
     this.deliveredQuestions = /* @__PURE__ */ new Set();
     // Map of short keys (e.g. u_1) -> full file URIs to stay under Telegram's 64-byte callback_data cap.
     this.uriMap = /* @__PURE__ */ new Map();
+    this.notifyOnComplete = true;
+    this.externalGenerating = false;
     this.opts = opts;
     this.chat = chat2;
     this.ownerChatId = opts.chatId?.trim() ?? "";
+    this.notifyOnComplete = opts.notifyOnComplete !== false;
   }
   encodeUriKey(uri) {
     if (!uri)
@@ -8196,6 +9008,9 @@ var TelegramBridge = class {
   }
   resolveUriKey(key) {
     return this.uriMap.get(key) || key;
+  }
+  setNotifyOnComplete(enabled) {
+    this.notifyOnComplete = enabled;
   }
   async start() {
     if (this.running)
@@ -8587,6 +9402,30 @@ ${mdToTgHtml(content)}`,
       `[tg] beginTurn id=${this.turnId}, seeded deliveredAssistants=${this.deliveredAssistantTexts.size}`
     );
   }
+  async handleExternalCompletion() {
+    if (!this.notifyOnComplete || !this.ownerChatId)
+      return;
+    try {
+      const state = await this.chat.getState();
+      const assistant = state.messages.filter((m) => m.role === "assistant" && m.text);
+      if (assistant.length === 0)
+        return;
+      const lastMsg = assistant[assistant.length - 1];
+      const key = assistantKey(lastMsg.text);
+      if (this.deliveredAssistantTexts.has(key))
+        return;
+      this.deliveredAssistantTexts.add(key);
+      this.opts.log(`[tg] notify on complete -> delivering finished reply (${lastMsg.text.length} chars) to ${this.ownerChatId}`);
+      await this.deliverText(
+        this.ownerChatId,
+        `\u{1F514} **Agent \u0111\xE3 tr\u1EA3 l\u1EDDi xong:**
+
+${lastMsg.text}`
+      );
+    } catch (err) {
+      this.opts.log(`[tg] notify on complete error: ${err?.message ?? err}`);
+    }
+  }
   onChatEvent(e) {
     if (!this.ownerChatId)
       return;
@@ -8597,55 +9436,71 @@ ${mdToTgHtml(content)}`,
           `[tg] cascade switch: ${this.currentCascade || "(none)"} -> ${e.state.cascadeId || "(empty)"} turnActive=${this.turnActive}`
         );
         this.currentCascade = e.state.cascadeId;
-        const assistant2 = e.state.messages.filter((m) => m.role === "assistant");
+        const assistant = e.state.messages.filter((m) => m.role === "assistant");
         if (!this.turnActive) {
           this.deliveredAssistantTexts = new Set(
-            assistant2.map((m) => assistantKey(m.text))
+            assistant.map((m) => assistantKey(m.text))
           );
           this.deliveredArtifacts = new Set(
             e.state.messages.filter((m) => m.role === "artifact" || m.role === "plan").map((m) => String(m.meta?.artifactUri ?? "")).filter(Boolean)
           );
           this.deliveredQuestions = /* @__PURE__ */ new Set();
           this.statusMsgId = null;
-        }
-        if (!this.turnActive)
+          this.externalGenerating = Boolean(e.state.generating);
           return;
-      }
-      if (!this.turnActive)
-        return;
-      this.opts.log(
-        `[tg] state event: cascade=${e.state.cascadeId.slice(0, 8)} generating=${e.state.generating} msgs=${e.state.messages.length} delivered=${this.deliveredAssistantTexts.size}`
-      );
-      const assistant = e.state.messages.filter((m) => m.role === "assistant");
-      const newMsgs = [];
-      for (const m of assistant) {
-        if (!m.text)
-          continue;
-        const key = assistantKey(m.text);
-        if (!this.deliveredAssistantTexts.has(key)) {
-          this.deliveredAssistantTexts.add(key);
-          newMsgs.push(m);
         }
       }
-      if (newMsgs.length > 0) {
+      if (this.turnActive) {
         this.opts.log(
-          `[tg] delivering ${newMsgs.length} new assistant message(s) (generating=${e.state.generating})` + (newMsgs[0] ? ` first="${newMsgs[0].text.slice(0, 60)}"` : "")
+          `[tg] state event: cascade=${e.state.cascadeId.slice(0, 8)} generating=${e.state.generating} msgs=${e.state.messages.length} delivered=${this.deliveredAssistantTexts.size}`
         );
-        for (const msg of newMsgs) {
-          void this.finishTurn(this.ownerChatId, msg.text, e.state.messages, myTurnId);
+        const assistant = e.state.messages.filter((m) => m.role === "assistant");
+        const newMsgs = [];
+        for (const m of assistant) {
+          if (!m.text)
+            continue;
+          const key = assistantKey(m.text);
+          if (!this.deliveredAssistantTexts.has(key)) {
+            this.deliveredAssistantTexts.add(key);
+            newMsgs.push(m);
+          }
         }
-      }
-      void this.deliverInteractiveElements(this.ownerChatId, e.state.messages);
-    } else if (e.type === "status") {
-      if (!this.turnActive)
+        if (newMsgs.length > 0) {
+          this.opts.log(
+            `[tg] delivering ${newMsgs.length} new assistant message(s) (generating=${e.state.generating})` + (newMsgs[0] ? ` first="${newMsgs[0].text.slice(0, 60)}"` : "")
+          );
+          for (const msg of newMsgs) {
+            void this.finishTurn(this.ownerChatId, msg.text, e.state.messages, myTurnId);
+          }
+        }
+        void this.deliverInteractiveElements(this.ownerChatId, e.state.messages);
         return;
-      if (e.generating) {
-        this.opts.log(`[tg] status: ${e.statusText}`);
-        void this.updateStatus(
-          this.ownerChatId,
-          `[AI] ${e.statusText || "\u0111ang x\u1EED l\xFD\u2026"}`,
-          myTurnId
-        );
+      }
+      const isGenerating2 = Boolean(e.state.generating);
+      if (this.externalGenerating && !isGenerating2) {
+        this.externalGenerating = false;
+        void this.handleExternalCompletion();
+      } else {
+        this.externalGenerating = isGenerating2;
+      }
+    } else if (e.type === "status") {
+      if (this.turnActive) {
+        if (e.generating) {
+          this.opts.log(`[tg] status: ${e.statusText}`);
+          void this.updateStatus(
+            this.ownerChatId,
+            `[AI] ${e.statusText || "\u0111ang x\u1EED l\xFD\u2026"}`,
+            myTurnId
+          );
+        }
+      } else {
+        const isGenerating2 = Boolean(e.generating);
+        if (this.externalGenerating && !isGenerating2) {
+          this.externalGenerating = false;
+          void this.handleExternalCompletion();
+        } else {
+          this.externalGenerating = isGenerating2;
+        }
       }
     }
   }
@@ -8886,23 +9741,37 @@ function delay2(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 function mdToTgHtml(text) {
+  if (!text)
+    return "";
   let s = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  s = s.replace(
-    /```(?:[^\n`]*)\n?([\s\S]*?)```/g,
-    (_, code) => `<pre><code>${code.trim()}</code></pre>`
-  );
-  s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, t) => `<b>${t}</b>`);
-  s = s.replace(/__([^_\n]+)__/g, (_, t) => `<b>${t}</b>`);
-  s = s.replace(/(?<!^\s*)\*([^*\n]+)\*/gm, (_, t) => `<i>${t}</i>`);
+  const codeBlocks = [];
+  s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    const tag = lang ? `<pre><code class="language-${lang}">${code.trim()}</code></pre>` : `<pre><code>${code.trim()}</code></pre>`;
+    codeBlocks.push(tag);
+    return `___CODE_BLOCK_${idx}___`;
+  });
+  const inlineCodes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${code}</code>`);
+    return `___INLINE_CODE_${idx}___`;
+  });
+  s = s.replace(/^#{1,6}\s+(.+)$/gm, (_, t) => `<b>${t.trim()}</b>`);
+  s = s.replace(/\*\*([^*\n]+?)\*\*/g, (_, t) => `<b>${t}</b>`);
+  s = s.replace(/__([^_\n]+?)__/g, (_, t) => `<b>${t}</b>`);
+  s = s.replace(/(^|\s)\*([^*\n]+?)\*(\s|$|[.,!?;:])/g, (_, p1, t, p2) => `${p1}<i>${t}</i>${p2}`);
+  s = s.replace(/(^|\s)_([^_\n]+?)_(\s|$|[.,!?;:])/g, (_, p1, t, p2) => `${p1}<i>${t}</i>${p2}`);
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
     if (url.startsWith("file://") || url.startsWith("#")) {
       return `<b>\u{1F4C4} ${label}</b>`;
     }
     return `<a href="${url}">${label}</a>`;
   });
-  s = s.replace(/^#{1,6}\s+(.+)$/gm, (_, t) => `<b>${t}</b>`);
+  s = s.replace(/^(\s*)[-*+]\s+/gm, "$1\u2022 ");
   s = s.replace(/^[-*_]{3,}$/gm, "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
+  s = s.replace(/___INLINE_CODE_(\d+)___/g, (_, idx) => inlineCodes[Number(idx)] || "");
+  s = s.replace(/___CODE_BLOCK_(\d+)___/g, (_, idx) => codeBlocks[Number(idx)] || "");
   return s;
 }
 function extractFileLinks(text) {
@@ -9112,6 +9981,11 @@ var WindowClient = class {
         return {
           root: FileController.root(),
           entries: FileController.list(payload.path ?? "")
+        };
+      case "files-search":
+        return {
+          root: FileController.root(),
+          entries: FileController.searchFiles(String(payload.query ?? ""), Number(payload.limit || 60))
         };
       case "file-read":
         return FileController.read(payload.path ?? "");
@@ -9328,16 +10202,7 @@ async function startAll(context) {
       vscode8.window.showErrorMessage(`Failed to start server on ${host}:${port} \u2014 ${e?.message ?? e}`);
       return;
     }
-    if (cfg("telegramEnabled", false)) {
-      const token = cfg("telegramToken", "");
-      const chatId = cfg("telegramChatId", "");
-      if (token) {
-        telegram = new TelegramBridge({ token, chatId, log }, chat);
-        await telegram.start();
-      } else {
-        log("[ext] telegram enabled but no token set");
-      }
-    }
+    await restartTelegram();
     updateStatusBar();
     const activePort = server.activePort;
     const lan = host === "0.0.0.0" ? lanIps() : [];
@@ -9413,11 +10278,32 @@ function stopAll() {
   client = null;
   chat?.stop();
   chat = null;
+  terminals = null;
   ls = null;
   running = false;
   isHost = false;
   updateStatusBar();
   log("[ext] stopped");
+}
+async function restartTelegram() {
+  if (telegram) {
+    telegram.stop();
+    telegram = null;
+  }
+  if (!isHost || !chat)
+    return;
+  if (cfg("telegramEnabled", false)) {
+    const token = cfg("telegramToken", "");
+    const chatId = cfg("telegramChatId", "");
+    const notifyOnComplete = cfg("telegramNotifyOnComplete", true);
+    if (token) {
+      telegram = new TelegramBridge({ token, chatId, notifyOnComplete, log }, chat);
+      await telegram.start();
+      log(`[ext] telegram started/reloaded (chatId: ${chatId || "any"}, notifyOnComplete: ${notifyOnComplete})`);
+    } else {
+      log("[ext] telegram enabled but no token set");
+    }
+  }
 }
 function openWeb() {
   const port = server?.activePort ?? cfg("port", 7377);
@@ -9519,7 +10405,15 @@ async function activate(context) {
     vscode8.commands.registerCommand(
       "antigravityRemotePlus.relaunchWithRemoteDebug",
       relaunchWithRemoteDebug
-    )
+    ),
+    vscode8.workspace.onDidChangeConfiguration(async (e) => {
+      if (e.affectsConfiguration("antigravityRemotePlus")) {
+        if (e.affectsConfiguration("antigravityRemotePlus.telegramEnabled") || e.affectsConfiguration("antigravityRemotePlus.telegramToken") || e.affectsConfiguration("antigravityRemotePlus.telegramChatId") || e.affectsConfiguration("antigravityRemotePlus.telegramNotifyOnComplete")) {
+          log("[ext] telegram configuration changed -> restarting telegram bridge");
+          await restartTelegram();
+        }
+      }
+    })
   );
   if (cfg("autoStart", true)) {
     setTimeout(() => startAll(context).catch((e) => log(`[ext] autostart: ${e}`)), 2e3);

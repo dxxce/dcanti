@@ -138,6 +138,7 @@ export interface RemoteSettings {
   telegramEnabled: boolean;
   telegramToken: string;
   telegramChatId: string;
+  telegramNotifyOnComplete: boolean;
   workspaceRoot: string;
 }
 
@@ -270,6 +271,10 @@ export const api = {
 
   files: (path = "") =>
     req<{ root: string; entries: FileEntry[] }>(`files?path=${encodeURIComponent(path)}`),
+  searchFiles: (query = "", limit = 60) =>
+    req<{ root: string; entries: FileEntry[] }>(
+      `files-search?q=${encodeURIComponent(query)}&limit=${limit}`
+    ),
   readFile: (path: string) =>
     req<{ text?: string; error?: string }>(`file?path=${encodeURIComponent(path)}`),
   writeFile: (path: string, text: string) =>

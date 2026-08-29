@@ -19,7 +19,13 @@ function fmtDuration(ms: number): string {
   return `${min}m ${s}s`;
 }
 
-export function SettingsPanel({ externalStats }: { externalStats?: any }) {
+export function SettingsPanel({
+  externalStats,
+  pingMs,
+}: {
+  externalStats?: any;
+  pingMs?: number | null;
+}) {
   const [settings, setSettings] = useState<RemoteSettings | null>(null);
   const [account, setAccount] = useState<AccountInfo | null>(null);
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
@@ -31,6 +37,89 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showPicker, setShowPicker] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem("agy_theme") || "obsidian");
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem("agy_sound") !== "false");
+  const [notifyComplete, setNotifyComplete] = useState(() => localStorage.getItem("agy_notify_complete") !== "false");
+
+  const applyTheme = (t: string) => {
+    setTheme(t);
+    localStorage.setItem("agy_theme", t);
+    document.documentElement.setAttribute("data-theme", t);
+  };
+
+  const toggleSound = (enabled: boolean) => {
+    setSoundEnabled(enabled);
+    localStorage.setItem("agy_sound", enabled ? "true" : "false");
+  };
+
+  const [notifyPermission, setNotifyPermission] = useState<string>(() =>
+    "Notification" in window ? Notification.permission : "unsupported"
+  );
+
+  const toggleNotifyComplete = (targetEnabled: boolean) => {
+    if (targetEnabled) {
+      if ("Notification" in window) {
+        if (Notification.permission === "default") {
+          // Direct invocation on user gesture (required by Apple iOS Safari)
+          Notification.requestPermission()
+            .then((perm) => {
+              setNotifyPermission(perm);
+              if (perm === "granted") {
+                setNotifyComplete(true);
+                localStorage.setItem("agy_notify_complete", "true");
+                try {
+                  new Notification("Antigravity Remote", {
+                    body: "Đã cấp quyền thông báo thành công!",
+                    icon: "icon.png",
+                  });
+                } catch {}
+              } else {
+                setNotifyComplete(false);
+                localStorage.setItem("agy_notify_complete", "false");
+                alert("Bạn đã từ chối cấp quyền thông báo.");
+              }
+            })
+            .catch((err) => {
+              console.error("[Notification Error]", err);
+            });
+          return;
+        } else if (Notification.permission === "denied") {
+          alert("Thông báo đã bị chặn trong Cài đặt trình duyệt/iOS. Vui lòng vào Cài đặt -> Thông báo để cho phép.");
+          setNotifyComplete(false);
+          localStorage.setItem("agy_notify_complete", "false");
+          return;
+        }
+      }
+      setNotifyComplete(true);
+      localStorage.setItem("agy_notify_complete", "true");
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification("Antigravity Remote", {
+            body: "Đã bật thông báo khi Agent hoàn thành!",
+            icon: "icon.png",
+          });
+        } catch {}
+      }
+    } else {
+      setNotifyComplete(false);
+      localStorage.setItem("agy_notify_complete", "false");
+    }
+  };
+
+  const sendTestNotification = () => {
+    if ("Notification" in window && Notification.permission === "granted") {
+      try {
+        new Notification("Antigravity Remote", {
+          body: "🎉 Thông báo thử nghiệm hoạt động tốt!",
+          icon: "icon.png",
+        });
+      } catch (e: any) {
+        alert("Lỗi gửi thông báo: " + e?.message);
+      }
+    } else {
+      toggleNotifyComplete(true);
+    }
+  };
 
   useEffect(() => {
     if (externalStats) setStats(externalStats);
@@ -68,13 +157,25 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
       const updated = await api.saveSettings(settings);
       setSettings(updated);
       setMsg(
-        "Saved. Server settings (port/password/host/telegram) apply on the next server restart — the extension restarts it automatically."
+        "Đã lưu cài đặt thành công! Cài đặt server sẽ tự động áp dụng sau khi restart."
       );
+      setTimeout(() => setMsg(""), 4000);
     } catch {
-      setMsg("Failed to save.");
+      setMsg("Không thể lưu cài đặt.");
     } finally {
       setBusy(false);
     }
+  };
+
+  const refreshQuota = async () => {
+    try {
+      const [acc, q] = await Promise.all([
+        api.account().catch(() => null),
+        api.quota().catch(() => null),
+      ]);
+      if (acc) setAccount(acc);
+      if (q) setQuota(q);
+    } catch {}
   };
 
   const switchAccount = async (email: string) => {
@@ -90,9 +191,9 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
         throw new Error(r.error || "Không thể chuyển tài khoản");
       }
 
-      // Verification loop: poll until the account is active or timeout
-      for (let i = 0; i < 8; i++) {
-        await new Promise((res) => setTimeout(res, 600));
+      // Poll periodically to wait for Language Server to populate new account's quota
+      for (let i = 0; i < 6; i++) {
+        await new Promise((res) => setTimeout(res, 800));
         try {
           const [acc, q] = await Promise.all([
             api.account().catch(() => null),
@@ -100,14 +201,22 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
           ]);
           if (acc) setAccount(acc);
           if (q) setQuota(q);
-          if (acc?.currentEmail === email || q?.account?.email === email) {
-            break;
-          }
         } catch {}
       }
 
-      await load();
-      setSuccessMsg(`Đã chuyển sang tài khoản ${email} thành công! Antigravity IDE đã sẵn sàng.`);
+      // Final refresh
+      await Promise.all([
+        api.account().then((a) => a && setAccount(a)).catch(() => {}),
+        api.quota().then((q) => q && setQuota(q)).catch(() => {}),
+        load().catch(() => {}),
+      ]);
+
+      const m = await api.models().catch(() => null);
+      if (Array.isArray(m?.models)) {
+        window.dispatchEvent(new CustomEvent("refresh-models", { detail: m.models }));
+      }
+
+      setSuccessMsg(`Đã chuyển sang tài khoản ${email} thành công! Đã làm mới Quota và hạn mức Model.`);
     } catch (e: any) {
       setErrorMsg(e?.message || "Lỗi khi chuyển tài khoản");
     } finally {
@@ -116,10 +225,38 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
     }
   };
 
-  if (!settings) return <div className="center muted">Loading settings…</div>;
+  if (!settings) return <div className="center muted">Đang tải cài đặt…</div>;
+
+  // Calculate dynamic tokens and latency stats
+  const totalToks = stats?.totalTokens || 0;
+  const promptToksEstimate = Math.round(totalToks * 0.65);
+  const completionToksEstimate = totalToks - promptToksEstimate;
+  const avgDurationPerChat =
+    stats && stats.totalChats > 0
+      ? Math.round(stats.totalDurationMs / stats.totalChats / 1000)
+      : 0;
+
+  const pingStatusClass =
+    pingMs == null ? "" : pingMs < 60 ? "ping-fast" : pingMs < 150 ? "ping-ok" : "ping-slow";
+  const pingStatusLabel =
+    pingMs == null
+      ? "Đang đo..."
+      : pingMs < 60
+      ? "Cực nhanh (<60ms)"
+      : pingMs < 150
+      ? "Ổn định (60-150ms)"
+      : "Chậm (>150ms)";
 
   return (
     <div className="settings">
+      {/* Header section */}
+      <div className="settings-top-header">
+        <div className="settings-title-group">
+          <h2>Cài đặt</h2>
+          <span className="settings-ver-badge">Antigravity Remote</span>
+        </div>
+      </div>
+
       {/* Account Switching Loading Overlay */}
       {switchingTarget && (
         <div className="account-switch-overlay">
@@ -160,13 +297,15 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
           </button>
         </div>
       )}
+
+      {/* Dynamic Statistics & Quota Forecasting Dashboard */}
       {stats != null && (
         <section className="card stats-section-card">
           <div className="stats-header">
-            <h3><Icon name="cpu" size={16} /> Thống kê hôm nay</h3>
+            <h3><Icon name="cpu" size={16} /> Thống kê hoạt động hôm nay</h3>
             <button
               className="ghost sm reset-stats-btn"
-              title="Đặt lại thống kê hôm nay về 0"
+              title="Đặt lại thống kê ngày hôm nay về 0"
               onClick={async () => {
                 if (confirm("Bạn có chắc chắn muốn reset thống kê ngày hôm nay về 0?")) {
                   const s = await api.resetStats();
@@ -175,66 +314,199 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
               }}
             >
               <Icon name="refresh" size={12} />
-              <span>Reset</span>
+              <span>Đặt lại</span>
             </button>
           </div>
-          <div className="stats-layout">
-            <div className="stats-row-top">
-              <div className="stat-card stat-chats">
-                <div className="stat-icon-wrapper"><Icon name="message" size={18} /></div>
-                <div className="stat-info">
-                  <span className="stat-value">{stats.totalChats}</span>
-                  <span className="stat-label">Số tin</span>
-                </div>
-              </div>
-              <div className="stat-card stat-duration">
-                <div className="stat-icon-wrapper"><Icon name="clock" size={18} /></div>
-                <div className="stat-info">
-                  <span className="stat-value">{fmtDuration(stats.totalDurationMs)}</span>
-                  <span className="stat-label">Tổng thời gian Agent xử lý</span>
-                </div>
+
+          <div className="stats-grid-dashboard">
+            <div className="stat-card stat-chats">
+              <div className="stat-icon-wrapper"><Icon name="message" size={18} /></div>
+              <div className="stat-info">
+                <span className="stat-value">{stats.totalChats}</span>
+                <span className="stat-label">Lượt trò chuyện</span>
               </div>
             </div>
-            <div className="stats-row-bottom">
-              <div className="stat-card stat-tokens stat-card-hero">
-                <div className="stat-icon-wrapper"><Icon name="zap" size={22} /></div>
-                <div className="stat-info">
-                  <span className="stat-value stat-value-hero">
-                    {stats.totalTokens.toLocaleString()}
-                  </span>
-                  <span className="stat-label">Tổng Tokens tiêu tốn</span>
-                </div>
+
+            <div className="stat-card stat-duration">
+              <div className="stat-icon-wrapper"><Icon name="clock" size={18} /></div>
+              <div className="stat-info">
+                <span className="stat-value">{fmtDuration(stats.totalDurationMs)}</span>
+                <span className="stat-label">Thời gian Agent xử lý</span>
+              </div>
+            </div>
+
+            <div className="stat-card stat-avg-speed">
+              <div className="stat-icon-wrapper"><Icon name="zap" size={18} /></div>
+              <div className="stat-info">
+                <span className="stat-value">{avgDurationPerChat}s</span>
+                <span className="stat-label">Thời gian trung bình</span>
+              </div>
+            </div>
+
+            <div className="stat-card stat-tokens">
+              <div className="stat-icon-wrapper"><Icon name="sparkles" size={18} /></div>
+              <div className="stat-info">
+                <span className="stat-value">{stats.totalTokens.toLocaleString()}</span>
+                <span className="stat-label">Tokens tiêu thụ</span>
+                {totalToks > 0 && (
+                  <div className="stat-token-pill-row">
+                    <span className="stat-mini-pill prompt-pill">In: {promptToksEstimate.toLocaleString()}</span>
+                    <span className="stat-mini-pill comp-pill">Out: {completionToksEstimate.toLocaleString()}</span>
+                  </div>
+                )}
               </div>
             </div>
           </div>
         </section>
       )}
 
+      {/* Theme Selector & Experience */}
+      <section className="card theme-section-card">
+        <h3><Icon name="sparkles" size={16} /> Giao diện & Trải nghiệm</h3>
+        <p className="muted small" style={{ marginTop: 0 }}>
+          Tùy chỉnh chủ đề màu sắc, âm thanh thông báo và rung phản hồi của Antigravity Remote Plus.
+        </p>
+
+        <div className="theme-grid">
+          <div
+            className={"theme-card" + (theme === "obsidian" ? " active" : "")}
+            onClick={() => applyTheme("obsidian")}
+          >
+            <div className="theme-preview obsidian" />
+            <div className="theme-card-info">
+              <span className="theme-card-name">🌌 Obsidian Studio</span>
+              <span className="theme-card-desc">Tối sâu thẳm, viền tím Indigo & Cyan</span>
+            </div>
+            {theme === "obsidian" && <span className="theme-check"><Icon name="check" size={14} /></span>}
+          </div>
+
+          <div
+            className={"theme-card" + (theme === "oled" ? " active" : "")}
+            onClick={() => applyTheme("oled")}
+          >
+            <div className="theme-preview oled" />
+            <div className="theme-card-info">
+              <span className="theme-card-name">🌑 Midnight OLED</span>
+              <span className="theme-card-desc">Đen thuần 100%, tiết kiệm pin màn OLED</span>
+            </div>
+            {theme === "oled" && <span className="theme-check"><Icon name="check" size={14} /></span>}
+          </div>
+
+          <div
+            className={"theme-card" + (theme === "tokyo" ? " active" : "")}
+            onClick={() => applyTheme("tokyo")}
+          >
+            <div className="theme-preview tokyo" />
+            <div className="theme-card-info">
+              <span className="theme-card-name">🌆 Tokyo Night</span>
+              <span className="theme-card-desc">Xanh tím trầm ấm chuẩn coder</span>
+            </div>
+            {theme === "tokyo" && <span className="theme-check"><Icon name="check" size={14} /></span>}
+          </div>
+
+          <div
+            className={"theme-card" + (theme === "cyberpunk" ? " active" : "")}
+            onClick={() => applyTheme("cyberpunk")}
+          >
+            <div className="theme-preview cyberpunk" />
+            <div className="theme-card-info">
+              <span className="theme-card-name">⚡ Cyberpunk Neon</span>
+              <span className="theme-card-desc">Điểm nhấn Neon Cyan & Amber rực rỡ</span>
+            </div>
+            {theme === "cyberpunk" && <span className="theme-check"><Icon name="check" size={14} /></span>}
+          </div>
+        </div>
+
+        <div className="sound-toggle-row">
+          <div className="sound-toggle-info">
+            <Icon name={soundEnabled ? "volume" : "volumeX"} size={16} />
+            <div>
+              <strong>Âm thanh thông báo &amp; Rung haptic</strong>
+              <div className="muted small">Phát chuông nhẹ và rung khi AI hoàn thành hoặc có câu hỏi</div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className={"sound-switch-btn" + (soundEnabled ? " active" : "")}
+            onClick={() => toggleSound(!soundEnabled)}
+          >
+            <span>{soundEnabled ? "Bật" : "Tắt"}</span>
+          </button>
+        </div>
+
+        <div className="sound-toggle-row" style={{ marginTop: 10 }}>
+          <div className="sound-toggle-info">
+            <Icon name="bell" size={16} />
+            <div>
+              <strong>Thông báo đẩy khi Agent trả lời xong</strong>
+              <div className="muted small">
+                Nhận thông báo hệ thống khi AI hoàn thành tác vụ ngay cả khi đang chuyển ứng dụng
+                {notifyPermission !== "unsupported" && (
+                  <span style={{ marginLeft: 6, opacity: 0.8 }}>
+                    ({notifyPermission === "granted" ? "🟢 Đã cấp quyền" : notifyPermission === "denied" ? "🔴 Bị từ chối quyền" : "🟡 Chưa cấp quyền"})
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              type="button"
+              className="ghost sm"
+              style={{ fontSize: 11, padding: "4px 8px" }}
+              onClick={sendTestNotification}
+              title="Bấm để thử nghiệm gửi thông báo hoặc cấp quyền"
+            >
+              {notifyPermission === "granted" ? "Gửi thử" : "Cấp quyền"}
+            </button>
+            <button
+              type="button"
+              className={"sound-switch-btn" + (notifyComplete ? " active" : "")}
+              onClick={() => toggleNotifyComplete(!notifyComplete)}
+            >
+              <span>{notifyComplete ? "Bật" : "Tắt"}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Account Switcher */}
       <section className="card">
-        <h3><Icon name="user" size={16} /> Tài khoản</h3>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h3 style={{ margin: 0 }}><Icon name="user" size={16} /> Quản lý Tài khoản</h3>
+          <button className="ghost sm" onClick={refreshQuota} title="Làm mới danh sách và quota">
+            <Icon name="refresh" size={12} /> <span>Làm mới</span>
+          </button>
+        </div>
         <AccountView account={account} busy={busy} onSwitch={switchAccount} />
       </section>
 
+      {/* Quota Section */}
       {quota && (
         <section className="card">
-          <h3><Icon name="gauge" size={16} /> Quota</h3>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <h3 style={{ margin: 0 }}><Icon name="gauge" size={16} /> Hạn mức Model & Quota</h3>
+            <button className="ghost sm" onClick={refreshQuota} title="Làm mới hạn mức Quota">
+              <Icon name="refresh" size={12} /> <span>Làm mới</span>
+            </button>
+          </div>
           <QuotaView quota={quota} />
         </section>
       )}
 
+      {/* Workspace Root Section */}
       <section className="card">
-        <h3><Icon name="folder" size={16} /> Workspace</h3>
+        <h3><Icon name="folder" size={16} /> Cấu hình Thư mục Workspace Root</h3>
         <p className="muted small" style={{ marginTop: 0 }}>
-          Chọn thư mục <strong>chứa các workspace</strong> (mỗi thư mục con là một
-          workspace), hoặc chọn thẳng một thư mục workspace — hệ thống tự hiểu.
+          Chọn thư mục chứa các dự án (mỗi thư mục con là một workspace độc lập) để Antigravity Remote tự động phát hiện.
         </p>
 
         <div className="form-grid">
-          <label>Thư mục workspace root</label>
+          <label>Đường dẫn thư mục Root</label>
           <div className="ws-root-row">
             <input
               type="text"
-              placeholder="vd: /Users/deece/Documents"
+              placeholder="vd: /Users/deece/Projects"
               value={settings.workspaceRoot}
               onChange={(e) => set("workspaceRoot", e.target.value)}
             />
@@ -243,7 +515,7 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
               onClick={() => setShowPicker((v) => !v)}
               title="Chọn thư mục"
             >
-              <Icon name="folder" size={15} /> <span>Chọn…</span>
+              <Icon name="folder" size={15} /> <span>Duyệt…</span>
             </button>
           </div>
         </div>
@@ -251,11 +523,9 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
         {showPicker && (
           <FolderPicker
             onPick={(dir) => {
-              // Save the chosen folder as the workspace root (do NOT reload the
-              // IDE) — the sidebar will list its sub-folders as workspaces.
               set("workspaceRoot", dir);
               setShowPicker(false);
-              setMsg('Đã chọn. Bấm "Lưu cài đặt" để áp dụng.');
+              setMsg('Đã chọn thư mục. Bấm "Lưu cài đặt" để áp dụng.');
             }}
           />
         )}
@@ -277,40 +547,42 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
         )}
       </section>
 
+      {/* Server Configuration */}
       <section className="card">
-        <h3>Server</h3>
+        <h3><Icon name="server" size={16} /> Cấu hình Máy chủ (Remote Server)</h3>
         <div className="form-grid">
-          <label>Port</label>
+          <label>Cổng kết nối (Port)</label>
           <input
             type="number"
             value={settings.port}
             onChange={(e) => set("port", Number(e.target.value))}
           />
 
-          <label>Bind host</label>
+          <label>Địa chỉ lắng nghe (Bind Host)</label>
           <select
             value={settings.bindHost}
             onChange={(e) => set("bindHost", e.target.value)}
           >
-            <option value="127.0.0.1">127.0.0.1 (localhost only)</option>
-            <option value="0.0.0.0">0.0.0.0 (LAN / internet)</option>
+            <option value="127.0.0.1">127.0.0.1 (Chỉ máy cục bộ)</option>
+            <option value="0.0.0.0">0.0.0.0 (Mở mạng LAN / Internet)</option>
           </select>
 
-          <label>Password</label>
+          <label>Mật khẩu truy cập</label>
           <input
             type="text"
+            placeholder="Để trống nếu không đặt mật khẩu"
             value={settings.password}
             onChange={(e) => set("password", e.target.value)}
           />
 
-          <label>Auto-start</label>
+          <label>Tự động khởi động cùng IDE</label>
           <input
             type="checkbox"
             checked={settings.autoStart}
             onChange={(e) => set("autoStart", e.target.checked)}
           />
 
-          <label>Remote-debug port</label>
+          <label>Cổng Remote-Debug</label>
           <input
             type="number"
             value={settings.remoteDebugPort}
@@ -319,22 +591,30 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
         </div>
         {settings.bindHost === "0.0.0.0" && !settings.password && (
           <div className="warn-text">
-            Binding to 0.0.0.0 without a password is unsafe. Set a password.
+            ⚠️ Đang mở lắng nghe 0.0.0.0 mà không đặt mật khẩu có thể không an toàn. Bạn nên đặt mật khẩu.
           </div>
         )}
       </section>
 
+      {/* Telegram Bot */}
       <section className="card">
-        <h3>Telegram</h3>
+        <h3><Icon name="message" size={16} /> Thông báo Telegram Bot</h3>
         <div className="form-grid">
-          <label>Enabled</label>
+          <label>Kích hoạt Telegram</label>
           <input
             type="checkbox"
             checked={settings.telegramEnabled}
             onChange={(e) => set("telegramEnabled", e.target.checked)}
           />
 
-          <label>Bot token</label>
+          <label>Thông báo khi Agent trả lời xong</label>
+          <input
+            type="checkbox"
+            checked={settings.telegramNotifyOnComplete !== false}
+            onChange={(e) => set("telegramNotifyOnComplete", e.target.checked)}
+          />
+
+          <label>Bot Token</label>
           <input
             type="text"
             placeholder="123456:ABC-DEF…"
@@ -342,26 +622,25 @@ export function SettingsPanel({ externalStats }: { externalStats?: any }) {
             onChange={(e) => set("telegramToken", e.target.value)}
           />
 
-          <label>Chat / user ID</label>
+          <label>Chat ID / User ID</label>
           <input
             type="text"
-            placeholder="e.g. 8247614754"
+            placeholder="vd: 8247614754"
             value={settings.telegramChatId}
             onChange={(e) => set("telegramChatId", e.target.value)}
           />
         </div>
         <p className="muted small">
-          Get the token from @BotFather. The chat ID restricts control to a single
-          Telegram chat — send your bot a message and check @userinfobot for your ID.
+          Lấy Bot Token từ @BotFather. Chat ID có thể lấy bằng cách nhắn tin cho bot và kiểm tra qua @userinfobot. Khi bật thông báo, Bot sẽ tự động gửi tin nhắn đến Telegram khi Agent trả lời xong (kể cả khi bạn gửi tin nhắn từ Web UI hoặc IDE).
         </p>
       </section>
 
       <div className="settings-actions">
         <button className="primary" onClick={save} disabled={busy}>
-          {busy ? "Saving…" : "Save settings"}
+          {busy ? "Đang lưu…" : "Lưu cài đặt"}
         </button>
         <button className="ghost" onClick={load} disabled={busy}>
-          Reload
+          Làm mới
         </button>
       </div>
       {msg && <div className="editor-msg">{msg}</div>}
@@ -503,24 +782,37 @@ function groupAccountQuotas(
       }));
 }
 
+function formatTier(tier?: string): string {
+  if (!tier) return "FREE";
+  const t = tier.toUpperCase();
+  if (t.includes("PRO") || t.includes("PLUS") || t.includes("ULTRA") || t.includes("PREMIUM") || t.includes("PAID") || t.includes("ENTERPRISE")) {
+    return "PRO";
+  }
+  return "FREE";
+}
+
 function QuotaView({ quota }: { quota: QuotaInfo }) {
   const pc = quota.credits?.promptCredits;
   const fc = quota.credits?.flowCredits;
-  const meter = (label: string, avail?: number, monthly?: number) => {
+
+  const renderCreditCard = (label: string, iconName: any, avail?: number, monthly?: number) => {
     if (avail == null && monthly == null) return null;
     const pct =
       monthly && monthly > 0 ? Math.min(100, Math.round(((avail ?? 0) / monthly) * 100)) : 0;
     return (
-      <div className="meter-row">
-        <div className="meter-label">
-          <span>{label}</span>
-          <span className="dim">
-            {avail ?? 0}
+      <div className="credit-meter-card">
+        <div className="credit-card-head">
+          <div className="credit-card-title">
+            <Icon name={iconName} size={15} />
+            <span>{label}</span>
+          </div>
+          <span className="credit-card-val">
+            <strong>{avail ?? 0}</strong>
             {monthly ? ` / ${monthly}` : ""}
           </span>
         </div>
-        <div className="meter">
-          <div className="meter-fill" style={{ width: `${pct}%` }} />
+        <div className="meter-track-premium">
+          <div className="meter-fill-premium" style={{ width: `${pct}%` }} />
         </div>
       </div>
     );
@@ -529,38 +821,60 @@ function QuotaView({ quota }: { quota: QuotaInfo }) {
   const groupedModels = groupModelQuotas(quota.modelQuota);
 
   return (
-    <div className="quota-view">
-      <div className="quota-plan">
-        <span className="badge">{quota.plan || "—"}</span>
+    <div className="quota-view-premium">
+      <div className="quota-header-card">
+        <div className="quota-plan-badge">
+          <Icon name="sparkles" size={13} />
+          <span>Gói: {formatTier(quota.plan)}</span>
+        </div>
         {quota.account?.email && (
-          <span className="dim small">{quota.account.email}</span>
+          <span className="quota-email-tag">{quota.account.email}</span>
         )}
       </div>
-      {meter("Prompt credits", pc?.available, pc?.monthly)}
-      {meter("Flow credits", fc?.available, fc?.monthly)}
+
+      <div className="credits-grid">
+        {renderCreditCard("Prompt Credits", "zap", pc?.available, pc?.monthly)}
+        {renderCreditCard("Flow Credits", "cpu", fc?.available, fc?.monthly)}
+      </div>
+
       {groupedModels.length > 0 && (
-        <>
-          <div className="quota-section-title">Model quota</div>
-          {groupedModels.map((m) => {
-            const pct = Math.round((m.remainingFraction ?? 0) * 100);
-            return (
-              <div key={m.label} className="model-quota-row">
-                <div className="model-quota-head">
-                  <span className="name">{m.label}</span>
-                  <span className="pct">{pct}%</span>
+        <div className="model-quota-container">
+          <div className="quota-section-title">
+            <Icon name="gauge" size={14} /> <span>Hạn mức theo từng Model</span>
+          </div>
+          <div className="model-quota-grid">
+            {groupedModels.map((m) => {
+              const pct = Math.round((m.remainingFraction ?? 0) * 100);
+              const isLow = pct < 20;
+              const isWarn = pct >= 20 && pct < 50;
+              const statusClass = isLow ? "meter-low" : isWarn ? "meter-warn" : "meter-good";
+              const isClaude = m.label.toLowerCase().includes("claude") || m.label.toLowerCase().includes("gpt");
+
+              return (
+                <div key={m.label} className={`model-quota-card ${statusClass}`}>
+                  <div className="model-quota-card-head">
+                    <div className="model-name-group">
+                      <span className="model-icon-dot" />
+                      <strong>{m.label}</strong>
+                    </div>
+                    <span className={`model-pct-badge ${statusClass}`}>{pct}%</span>
+                  </div>
+
+                  <div className="meter-track-premium sm">
+                    <div className={`meter-fill-premium ${statusClass}`} style={{ width: `${pct}%` }} />
+                  </div>
+
+                  {m.resetTime && (
+                    <div className="model-reset-row">
+                      <Icon name="clock" size={11} />
+                      <span>Hồi lại: {new Date(m.resetTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                    </div>
+                  )}
                 </div>
-                <div className="meter">
-                  <div className="meter-fill" style={{ width: `${pct}%` }} />
-                </div>
-                {m.resetTime && (
-                  <span className="reset-time">
-                    reset {new Date(m.resetTime).toLocaleString()}
-                  </span>
-                )}
-              </div>
-            );
-          })}
-        </>
+              );
+            })}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -592,8 +906,12 @@ function AccountView({
     }
   };
 
-  // Current account first, then sort by name
+  const isPro = (tier?: string) => formatTier(tier) === "PRO";
+
   const sorted = [...accounts].sort((a, b) => {
+    const aPro = isPro(a.tier);
+    const bPro = isPro(b.tier);
+    if (aPro !== bPro) return aPro ? -1 : 1;
     if (a.current !== b.current) return a.current ? -1 : 1;
     return (a.name || a.email).localeCompare(b.name || b.email);
   });
@@ -602,7 +920,7 @@ function AccountView({
     s.trim().slice(0, 2).toUpperCase() || "?";
 
   return (
-    <div className="account-list">
+    <div className="account-list-premium">
       {sorted.map((a) => {
         const open = expanded === a.id;
         const isSwitching = switchingEmail === a.email;
@@ -610,79 +928,106 @@ function AccountView({
         const lowest = [...groupedQuota].sort(
           (x, y) => x.percentage - y.percentage
         )[0];
+
+        const tierLabel = formatTier(a.tier);
+
         return (
           <div
             key={a.id || a.email}
-            className={"account-card" + (a.current ? " current" : "")}
+            className={"account-card-premium" + (a.current ? " current-active" : "")}
           >
-            <div className="account-main">
-              <div className={"account-avatar" + (a.current ? " on" : "")}>
+            <div className="account-card-top">
+              <div className={"account-avatar-circle" + (a.current ? " glow" : "")}>
                 {initials(a.name || a.email)}
               </div>
-              <div className="account-meta">
-                <div className="account-name-row">
-                  <span className="account-name-text">{a.name || a.email}</span>
+
+              <div className="account-details">
+                <div className="account-details-name-row">
+                  <span className="account-user-name">{a.name || a.email}</span>
                   {a.current ? (
-                    <span className="account-badge active">
-                      <Icon name="check" size={11} /> <span>Đang dùng</span>
+                    <span className="account-status-badge active">
+                      <Icon name="check" size={10} /> <span>Đang dùng</span>
                     </span>
                   ) : (
-                    a.disabled && <span className="account-badge off">Khóa</span>
+                    a.disabled && <span className="account-status-badge off">Bị khóa</span>
                   )}
+                  <span className={`account-tier-badge ${tierLabel.toLowerCase()}`}>{tierLabel}</span>
                 </div>
-                <div className="account-email">{a.email}</div>
-                {a.tier && <div className="account-tier">{a.tier}</div>}
+                <div className="account-user-email">{a.email}</div>
               </div>
-              <div className="account-actions">
-                {lowest && (
-                  <span
-                    className={"account-quota-mini " + (lowest.percentage < 20 ? "low" : lowest.percentage < 50 ? "warn" : "")}
-                    title={`${lowest.displayName}: ${lowest.percentage}% còn lại`}
-                  >
-                    {lowest.percentage}%
-                  </span>
-                )}
-                {!a.current && (
+
+              <div className="account-card-actions">
+                {!a.current ? (
                   <button
-                    className="primary sm btn-switch-acc"
+                    className="primary sm btn-switch-premium"
                     disabled={busy || isSwitching}
                     onClick={() => handleSwitch(a.email)}
                   >
                     <Icon
                       name={isSwitching ? "spinner" : "refresh"}
-                      size={13}
+                      size={12}
                       className={isSwitching ? "spin" : ""}
                     />
-                    <span>{isSwitching ? "Đang chuyển…" : "Chuyển"}</span>
+                    <span>{isSwitching ? "Đang đổi…" : "Chuyển"}</span>
                   </button>
+                ) : (
+                  <span className="account-active-indicator">
+                    <span className="active-green-dot" /> Sẵn sàng
+                  </span>
                 )}
+
                 {groupedQuota.length > 0 && (
                   <button
-                    className="ghost icon-btn sm"
+                    className="ghost icon-btn sm btn-toggle-quota"
                     onClick={() => setExpanded(open ? null : a.id)}
-                    title="Xem chi tiết quota"
+                    title="Chi tiết quota"
                   >
                     <Icon name={open ? "chevronDown" : "chevronRight"} size={14} />
                   </button>
                 )}
               </div>
             </div>
-            {open && groupedQuota.length > 0 && (
-              <div className="account-quota-dropdown">
+
+            {/* Mini Quota Summary Bar */}
+            {groupedQuota.length > 0 && (
+              <div className="account-quota-summary-pills">
                 {groupedQuota.map((m) => {
-                  const pctClass = m.percentage < 20 ? "err" : m.percentage < 50 ? "warn" : "";
+                  const isLow = m.percentage < 20;
+                  const isWarn = m.percentage >= 20 && m.percentage < 50;
+                  const pillClass = isLow ? "pill-low" : isWarn ? "pill-warn" : "pill-good";
                   return (
-                    <div key={m.name} className="mini-meter-row">
-                      <div className="mini-meter-label">
+                    <div key={m.name} className={`quota-mini-pill ${pillClass}`}>
+                      <span className="pill-name">{m.displayName}:</span>
+                      <strong>{m.percentage}%</strong>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Dropdown Full Quota Detail */}
+            {open && groupedQuota.length > 0 && (
+              <div className="account-quota-dropdown-premium">
+                {groupedQuota.map((m) => {
+                  const pctClass = m.percentage < 20 ? "err" : m.percentage < 50 ? "warn" : "good";
+                  return (
+                    <div key={m.name} className="account-meter-row">
+                      <div className="account-meter-label">
                         <span>{m.displayName || m.name}</span>
-                        <span className={"dim " + pctClass}>{m.percentage}%</span>
+                        <span className={`pct-value ${pctClass}`}>{m.percentage}%</span>
                       </div>
-                      <div className="meter sm">
+                      <div className="meter-track-premium sm">
                         <div
-                          className={"meter-fill " + pctClass}
+                          className={`meter-fill-premium ${pctClass}`}
                           style={{ width: `${m.percentage}%` }}
                         />
                       </div>
+                      {m.resetTime && (
+                        <div className="account-meter-reset">
+                          <Icon name="clock" size={10} />
+                          <span>Hồi lại: {new Date(m.resetTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

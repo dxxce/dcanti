@@ -16,6 +16,7 @@ import { GitController } from "./gitController";
 export interface TelegramOptions {
   token: string;
   chatId: string; // allowed chat id; empty => first chat that /start's becomes owner
+  notifyOnComplete?: boolean;
   log: (m: string) => void;
 }
 
@@ -152,6 +153,8 @@ export class TelegramBridge {
   private deliveredQuestions = new Set<string>();
   // Map of short keys (e.g. u_1) -> full file URIs to stay under Telegram's 64-byte callback_data cap.
   private uriMap = new Map<string, string>();
+  private notifyOnComplete = true;
+  private externalGenerating = false;
 
   private encodeUriKey(uri: string): string {
     if (!uri) return "";
@@ -171,6 +174,11 @@ export class TelegramBridge {
     this.opts = opts;
     this.chat = chat;
     this.ownerChatId = opts.chatId?.trim() ?? "";
+    this.notifyOnComplete = opts.notifyOnComplete !== false;
+  }
+
+  setNotifyOnComplete(enabled: boolean) {
+    this.notifyOnComplete = enabled;
   }
 
   async start() {
@@ -602,6 +610,27 @@ export class TelegramBridge {
     );
   }
 
+  private async handleExternalCompletion() {
+    if (!this.notifyOnComplete || !this.ownerChatId) return;
+    try {
+      const state = await this.chat.getState();
+      const assistant = state.messages.filter((m) => m.role === "assistant" && m.text);
+      if (assistant.length === 0) return;
+      const lastMsg = assistant[assistant.length - 1];
+      const key = assistantKey(lastMsg.text);
+      if (this.deliveredAssistantTexts.has(key)) return;
+      this.deliveredAssistantTexts.add(key);
+
+      this.opts.log(`[tg] notify on complete -> delivering finished reply (${lastMsg.text.length} chars) to ${this.ownerChatId}`);
+      await this.deliverText(
+        this.ownerChatId,
+        `🔔 **Agent đã trả lời xong:**\n\n${lastMsg.text}`
+      );
+    } catch (err: any) {
+      this.opts.log(`[tg] notify on complete error: ${err?.message ?? err}`);
+    }
+  }
+
   private onChatEvent(e: ChatEvent) {
     if (!this.ownerChatId) return;
     // Capture the current turn id at the moment this event fires so that any
@@ -636,57 +665,72 @@ export class TelegramBridge {
           );
           this.deliveredQuestions = new Set();
           this.statusMsgId = null;
-        }
-        // When turn IS active, we continue — the cascade switch is just the
-        // controller re-resolving the id mid-send; we don't kill the turn.
-        if (!this.turnActive) return;
-      }
-
-      // Only deliver answers/artifacts while a turn we started is active — this
-      // stops idle poller settles from producing spurious "xong"/answers.
-      if (!this.turnActive) return;
-
-      this.opts.log(
-        `[tg] state event: cascade=${e.state.cascadeId.slice(0,8)} generating=${e.state.generating} msgs=${e.state.messages.length} delivered=${this.deliveredAssistantTexts.size}`
-      );
-
-      // Deliver any new assistant messages immediately as soon as they appear,
-      // without waiting for generating to flip false.
-      const assistant = e.state.messages.filter((m) => m.role === "assistant");
-      const newMsgs: any[] = [];
-      for (const m of assistant) {
-        if (!m.text) continue;
-        const key = assistantKey(m.text);
-        if (!this.deliveredAssistantTexts.has(key)) {
-          this.deliveredAssistantTexts.add(key);
-          newMsgs.push(m);
+          this.externalGenerating = Boolean(e.state.generating);
+          return;
         }
       }
-      if (newMsgs.length > 0) {
+
+      // If turn was started from Telegram:
+      if (this.turnActive) {
         this.opts.log(
-          `[tg] delivering ${newMsgs.length} new assistant message(s) (generating=${e.state.generating})` +
-            (newMsgs[0] ? ` first="${newMsgs[0].text.slice(0, 60)}"` : "")
+          `[tg] state event: cascade=${e.state.cascadeId.slice(0,8)} generating=${e.state.generating} msgs=${e.state.messages.length} delivered=${this.deliveredAssistantTexts.size}`
         );
-        for (const msg of newMsgs) {
-          void this.finishTurn(this.ownerChatId, msg.text, e.state.messages, myTurnId);
+
+        // Deliver any new assistant messages immediately as soon as they appear,
+        // without waiting for generating to flip false.
+        const assistant = e.state.messages.filter((m) => m.role === "assistant");
+        const newMsgs: any[] = [];
+        for (const m of assistant) {
+          if (!m.text) continue;
+          const key = assistantKey(m.text);
+          if (!this.deliveredAssistantTexts.has(key)) {
+            this.deliveredAssistantTexts.add(key);
+            newMsgs.push(m);
+          }
         }
+        if (newMsgs.length > 0) {
+          this.opts.log(
+            `[tg] delivering ${newMsgs.length} new assistant message(s) (generating=${e.state.generating})` +
+              (newMsgs[0] ? ` first="${newMsgs[0].text.slice(0, 60)}"` : "")
+          );
+          for (const msg of newMsgs) {
+            void this.finishTurn(this.ownerChatId, msg.text, e.state.messages, myTurnId);
+          }
+        }
+
+        // Always deliver interactive elements (artifacts, plans, ask questions)
+        void this.deliverInteractiveElements(this.ownerChatId, e.state.messages);
+        return;
       }
 
-      // Always deliver interactive elements (artifacts, plans, ask questions)
-      void this.deliverInteractiveElements(this.ownerChatId, e.state.messages);
+      // If turn was started externally (from Web UI or IDE) and notifyOnComplete is enabled:
+      const isGenerating = Boolean(e.state.generating);
+      if (this.externalGenerating && !isGenerating) {
+        this.externalGenerating = false;
+        void this.handleExternalCompletion();
+      } else {
+        this.externalGenerating = isGenerating;
+      }
     } else if (e.type === "status") {
       // Mirror progress ONLY during an active turn, all in the one status
-      // message (edited in place). Ignore the "done" flip here — the turn ends
-      // when the assistant answer arrives (finishTurn), which avoids a premature
-      // "xong" between tool steps.
-      if (!this.turnActive) return;
-      if (e.generating) {
-        this.opts.log(`[tg] status: ${e.statusText}`);
-        void this.updateStatus(
-          this.ownerChatId,
-          `[AI] ${e.statusText || "đang xử lý…"}`,
-          myTurnId
-        );
+      // message (edited in place).
+      if (this.turnActive) {
+        if (e.generating) {
+          this.opts.log(`[tg] status: ${e.statusText}`);
+          void this.updateStatus(
+            this.ownerChatId,
+            `[AI] ${e.statusText || "đang xử lý…"}`,
+            myTurnId
+          );
+        }
+      } else {
+        const isGenerating = Boolean(e.generating);
+        if (this.externalGenerating && !isGenerating) {
+          this.externalGenerating = false;
+          void this.handleExternalCompletion();
+        } else {
+          this.externalGenerating = isGenerating;
+        }
       }
     }
   }
@@ -951,36 +995,46 @@ function delay(ms: number): Promise<void> {
 }
 
 // Convert AI markdown to Telegram HTML (parse_mode="HTML").
-// Handles the most common elements produced by the AI: code blocks, inline
-// code, bold, italic, links, and headings. Everything else is plain text.
-// Special HTML characters are escaped first so Telegram doesn't reject the
-// message.
+// Handles code blocks, inline code, bold, italic, links, bullets, and headings cleanly.
 function mdToTgHtml(text: string): string {
-  // Step 1: escape HTML special chars so they're safe inside our real tags.
+  if (!text) return "";
+  // Step 1: escape HTML special chars first
   let s = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
-  // Step 2: fenced code blocks (```lang\ncode```).
-  s = s.replace(
-    /```(?:[^\n`]*)\n?([\s\S]*?)```/g,
-    (_, code) => `<pre><code>${code.trim()}</code></pre>`
-  );
+  // Step 2: protect fenced code blocks (```lang\ncode```) with tokens
+  const codeBlocks: string[] = [];
+  s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    const tag = lang
+      ? `<pre><code class="language-${lang}">${code.trim()}</code></pre>`
+      : `<pre><code>${code.trim()}</code></pre>`;
+    codeBlocks.push(tag);
+    return `___CODE_BLOCK_${idx}___`;
+  });
 
-  // Step 3: inline code (`code`)
-  s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code>${code}</code>`);
+  // Step 3: protect inline code (`code`) with tokens
+  const inlineCodes: string[] = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${code}</code>`);
+    return `___INLINE_CODE_${idx}___`;
+  });
 
-  // Step 4: bold **text** or __text__ (strictly single line to avoid dotAll span crashes)
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, t) => `<b>${t}</b>`);
-  s = s.replace(/__([^_\n]+)__/g, (_, t) => `<b>${t}</b>`);
+  // Step 4: headings # H1 ## H2 … → <b>H1</b>
+  s = s.replace(/^#{1,6}\s+(.+)$/gm, (_, t) => `<b>${t.trim()}</b>`);
 
-  // Step 5: italic *text* or _text_ (only when not at start of bullet line)
-  s = s.replace(/(?<!^\s*)\*([^*\n]+)\*/gm, (_, t) => `<i>${t}</i>`);
+  // Step 5: bold **text** or __text__
+  s = s.replace(/\*\*([^*\n]+?)\*\*/g, (_, t) => `<b>${t}</b>`);
+  s = s.replace(/__([^_\n]+?)__/g, (_, t) => `<b>${t}</b>`);
 
-  // Step 6: markdown links [label](url)
-  //   - file:// and # anchors → render as bold file title with icon
-  //   - web links → <a href="url">label</a>
+  // Step 6: italic *text* or _text_ (excluding bullets)
+  s = s.replace(/(^|\s)\*([^*\n]+?)\*(\s|$|[.,!?;:])/g, (_, p1, t, p2) => `${p1}<i>${t}</i>${p2}`);
+  s = s.replace(/(^|\s)_([^_\n]+?)_(\s|$|[.,!?;:])/g, (_, p1, t, p2) => `${p1}<i>${t}</i>${p2}`);
+
+  // Step 7: markdown links [label](url)
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
     if (url.startsWith("file://") || url.startsWith("#")) {
       return `<b>📄 ${label}</b>`;
@@ -988,11 +1042,15 @@ function mdToTgHtml(text: string): string {
     return `<a href="${url}">${label}</a>`;
   });
 
-  // Step 7: headings # H1 ## H2 … → bold line
-  s = s.replace(/^#{1,6}\s+(.+)$/gm, (_, t) => `<b>${t}</b>`);
+  // Step 8: bullets - / * at start of line → •
+  s = s.replace(/^(\s*)[-*+]\s+/gm, "$1• ");
 
-  // Step 8: horizontal rules --- / *** / ___ → a separator line
+  // Step 9: horizontal rules --- / *** / ___ → a separator line
   s = s.replace(/^[-*_]{3,}$/gm, "─────────────────");
+
+  // Step 10: restore protected tokens
+  s = s.replace(/___INLINE_CODE_(\d+)___/g, (_, idx) => inlineCodes[Number(idx)] || "");
+  s = s.replace(/___CODE_BLOCK_(\d+)___/g, (_, idx) => codeBlocks[Number(idx)] || "");
 
   return s;
 }

@@ -239,6 +239,11 @@ export class WindowClient {
           root: FileController.root(),
           entries: FileController.list(payload.path ?? ""),
         };
+      case "files-search":
+        return {
+          root: FileController.root(),
+          entries: FileController.searchFiles(String(payload.query ?? ""), Number(payload.limit || 60)),
+        };
       case "file-read":
         return FileController.read(payload.path ?? "");
       case "file-write":

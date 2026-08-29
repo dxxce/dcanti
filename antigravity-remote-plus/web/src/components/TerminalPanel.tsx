@@ -4,17 +4,16 @@ import { termBus } from "../termBus";
 import { Icon } from "./Icon";
 
 interface Props {
-  // The workspace path the terminals should open in (cwd). Null → home.
   cwd: string | null;
 }
 
-// Quick command shortcuts pre-filled into the input on click.
-const PRESETS: Array<{ label: string; cmd: string }> = [
-  { label: "ls", cmd: "ls -la" },
+const DEFAULT_PRESETS: Array<{ label: string; cmd: string }> = [
+  { label: "ls -la", cmd: "ls -la" },
   { label: "git status", cmd: "git status" },
   { label: "git pull", cmd: "git pull" },
-  { label: "npm install", cmd: "npm install" },
-  { label: "npm run dev", cmd: "npm run dev" },
+  { label: "pnpm dev", cmd: "pnpm dev" },
+  { label: "pnpm build", cmd: "pnpm build" },
+  { label: "npm test", cmd: "npm test" },
   { label: "clear", cmd: "clear" },
 ];
 
@@ -22,8 +21,24 @@ export function TerminalPanel({ cwd }: Props) {
   const [terminals, setTerminals] = useState<TerminalInfo[]>([]);
   const [activeId, setActiveId] = useState<string>("");
   const [input, setInput] = useState("");
-  // Per-terminal output buffers kept in a ref so streaming doesn't re-render
-  // the whole tree on every chunk; we bump a counter to repaint the active one.
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [searchLog, setSearchLog] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const [presets, setPresets] = useState<Array<{ label: string; cmd: string }>>(() => {
+    try {
+      const saved = localStorage.getItem("agy_term_presets");
+      return saved ? JSON.parse(saved) : DEFAULT_PRESETS;
+    } catch {
+      return DEFAULT_PRESETS;
+    }
+  });
+
+  const [newMacroOpen, setNewMacroOpen] = useState(false);
+  const [macroLabel, setMacroLabel] = useState("");
+  const [macroCmd, setMacroCmd] = useState("");
+
   const buffers = useRef<Record<string, string>>({});
   const [, forceRepaint] = useState(0);
   const outRef = useRef<HTMLPreElement>(null);
@@ -31,14 +46,12 @@ export function TerminalPanel({ cwd }: Props) {
 
   const repaint = useCallback(() => forceRepaint((n) => n + 1), []);
 
-  // Load existing terminals on mount; create one if none exist.
   useEffect(() => {
     (async () => {
       const { terminals: list } = await api.termList();
       setTerminals(list);
       if (list.length > 0) {
         setActiveId((cur) => cur || list[0].id);
-        // Prime buffers for existing terminals.
         for (const t of list) {
           const { buffer } = await api.termBuffer(t.id);
           buffers.current[t.id] = buffer;
@@ -46,10 +59,8 @@ export function TerminalPanel({ cwd }: Props) {
         repaint();
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subscribe to streamed terminal frames.
   useEffect(() => {
     return termBus.subscribe((e) => {
       if (e.type === "term-data") {
@@ -65,10 +76,11 @@ export function TerminalPanel({ cwd }: Props) {
     });
   }, [repaint]);
 
-  // Auto-scroll the active terminal to the bottom on new output.
   useEffect(() => {
-    const el = outRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (autoScroll) {
+      const el = outRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
   });
 
   const createTerm = async () => {
@@ -93,7 +105,6 @@ export function TerminalPanel({ cwd }: Props) {
 
   const runLine = async (line: string) => {
     if (!activeId) {
-      // No terminal yet — create one, then send.
       const info = await api.termCreate(cwd ?? undefined);
       buffers.current[info.id] = "";
       setActiveId(info.id);
@@ -114,10 +125,49 @@ export function TerminalPanel({ cwd }: Props) {
       e.preventDefault();
       submit();
     } else if (e.key === "c" && e.ctrlKey) {
-      // Ctrl-C → send interrupt to the shell.
       e.preventDefault();
       if (activeId) api.termInput(activeId, "\x03");
     }
+  };
+
+  const sendCtrlC = () => {
+    if (activeId) api.termInput(activeId, "\x03");
+  };
+
+  const clearActiveBuffer = () => {
+    if (activeId) {
+      buffers.current[activeId] = "";
+      repaint();
+    }
+  };
+
+  const copyLog = () => {
+    if (!activeId) return;
+    const text = buffers.current[activeId] ?? "";
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const addMacro = () => {
+    if (!macroLabel.trim() || !macroCmd.trim()) return;
+    const next = [...presets, { label: macroLabel.trim(), cmd: macroCmd.trim() }];
+    setPresets(next);
+    try {
+      localStorage.setItem("agy_term_presets", JSON.stringify(next));
+    } catch {}
+    setMacroLabel("");
+    setMacroCmd("");
+    setNewMacroOpen(false);
+  };
+
+  const removeMacro = (index: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const next = presets.filter((_, i) => i !== index);
+    setPresets(next);
+    try {
+      localStorage.setItem("agy_term_presets", JSON.stringify(next));
+    } catch {}
   };
 
   const activeBuffer = activeId ? buffers.current[activeId] ?? "" : "";
@@ -149,7 +199,66 @@ export function TerminalPanel({ cwd }: Props) {
         <button className="term-new" onClick={createTerm} title="Terminal mới">
           <Icon name="plus" size={15} />
         </button>
+
+        <div className="spacer" />
+
+        <div className="term-top-actions">
+          <button
+            type="button"
+            className={"ghost icon-btn sm" + (showSearch ? " active" : "")}
+            onClick={() => setShowSearch(!showSearch)}
+            title="Tìm kiếm trong output log"
+          >
+            <Icon name="search" size={13} />
+          </button>
+          <button
+            type="button"
+            className={"ghost icon-btn sm" + (autoScroll ? " active" : "")}
+            onClick={() => setAutoScroll(!autoScroll)}
+            title={autoScroll ? "Đang tự động cuộn (Nhấn để khóa)" : "Đang khóa cuộn (Nhấn để tự cuộn)"}
+          >
+            <Icon name="arrowDown" size={13} />
+          </button>
+          <button
+            type="button"
+            className="ghost icon-btn sm"
+            onClick={copyLog}
+            title="Sao chép toàn bộ log"
+          >
+            <Icon name={copied ? "check" : "copy"} size={13} />
+          </button>
+          <button
+            type="button"
+            className="ghost icon-btn sm"
+            onClick={clearActiveBuffer}
+            title="Xóa sạch màn hình terminal"
+          >
+            <Icon name="trash" size={13} />
+          </button>
+        </div>
       </div>
+
+      {showSearch && (
+        <div className="term-search-bar">
+          <Icon name="search" size={13} />
+          <input
+            type="text"
+            placeholder="Tìm kiếm chuỗi trong terminal log..."
+            value={searchLog}
+            onChange={(e) => setSearchLog(e.target.value)}
+            autoFocus
+          />
+          {searchLog && (
+            <button
+              type="button"
+              className="ghost icon-btn sm"
+              onClick={() => setSearchLog("")}
+            >
+              <Icon name="close" size={12} />
+            </button>
+          )}
+        </div>
+      )}
 
       {terminals.length === 0 ? (
         <div className="term-empty">
@@ -168,17 +277,58 @@ export function TerminalPanel({ cwd }: Props) {
           <div className="term-composer">
             <div className="term-composer-box">
               <div className="term-presets">
-                {PRESETS.map((p) => (
-                  <button
-                    key={p.label}
-                    className="term-preset"
-                    onClick={() => runLine(p.cmd)}
-                    title={p.cmd}
-                  >
-                    {p.label}
-                  </button>
+                {presets.map((p, idx) => (
+                  <div key={idx} className="term-preset-wrap">
+                    <button
+                      className="term-preset"
+                      onClick={() => runLine(p.cmd)}
+                      title={p.cmd}
+                    >
+                      <Icon name="zap" size={11} />
+                      <span>{p.label}</span>
+                    </button>
+                    {idx >= DEFAULT_PRESETS.length && (
+                      <button
+                        className="term-preset-del"
+                        onClick={(e) => removeMacro(idx, e)}
+                        title="Xóa macro này"
+                      >
+                        <Icon name="close" size={9} />
+                      </button>
+                    )}
+                  </div>
                 ))}
+                <button
+                  className="term-preset add-preset"
+                  onClick={() => setNewMacroOpen(true)}
+                  title="Thêm phím tắt lệnh mới"
+                >
+                  <Icon name="plus" size={11} /> <span>Thêm Macro</span>
+                </button>
               </div>
+
+              {newMacroOpen && (
+                <div className="new-macro-row">
+                  <input
+                    type="text"
+                    placeholder="Tên nút (vd: Build)..."
+                    value={macroLabel}
+                    onChange={(e) => setMacroLabel(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Lệnh (vd: pnpm build)..."
+                    value={macroCmd}
+                    onChange={(e) => setMacroCmd(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addMacro();
+                      if (e.key === "Escape") setNewMacroOpen(false);
+                    }}
+                  />
+                  <button className="primary sm" onClick={addMacro}>Lưu</button>
+                  <button className="ghost sm" onClick={() => setNewMacroOpen(false)}>Hủy</button>
+                </div>
+              )}
 
               <div className="term-input-row">
                 <span className="term-prompt">$</span>
@@ -187,16 +337,23 @@ export function TerminalPanel({ cwd }: Props) {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={onKeyDown}
-                  placeholder="Nhập lệnh rồi Enter…  (Ctrl+C để dừng)"
+                  placeholder="Nhập lệnh rồi Enter… (Ctrl+C để dừng)"
                   spellCheck={false}
                   autoCapitalize="off"
                   autoCorrect="off"
                 />
                 <button
+                  className="ghost icon-btn term-ctrl-c"
+                  onClick={sendCtrlC}
+                  title="Gửi Ctrl+C để dừng lệnh"
+                >
+                  <span>Ctrl+C</span>
+                </button>
+                <button
                   className="primary icon-btn term-run"
                   onClick={submit}
                   disabled={!input.trim()}
-                  title="Chạy"
+                  title="Chạy lệnh"
                 >
                   <Icon name="send" size={15} />
                 </button>

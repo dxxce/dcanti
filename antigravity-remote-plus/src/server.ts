@@ -489,6 +489,11 @@ export class RemoteServer {
         const rel = url.searchParams.get("path") ?? "";
         return rpc("files", { path: rel });
       }
+      case "files-search": {
+        const q = url.searchParams.get("q") ?? url.searchParams.get("query") ?? "";
+        const limit = parseInt(url.searchParams.get("limit") || "60", 10);
+        return rpc("files-search", { query: q, limit });
+      }
       case "file": {
         if (req.method === "GET") {
           const rel = url.searchParams.get("path") ?? "";

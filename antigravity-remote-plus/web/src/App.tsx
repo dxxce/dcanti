@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   UnauthorizedError,
   type ChatState,
+  type ChatMessage,
   type Trajectory,
   type ModelInfo,
   type IdeWindowInfo,
 } from "./api";
 import { useEvents, type ServerEvent } from "./useEvents";
 import { termBus } from "./termBus";
+import { playNotificationSound, playQuestionSound, notifyAgentCompleted } from "./sound";
 import { Login } from "./components/Login";
 import { ChatPanel } from "./components/ChatPanel";
 import { Sidebar } from "./components/Sidebar";
@@ -67,6 +69,7 @@ export function App() {
   const [authed, setAuthed] = useState(false);
   const [checking, setChecking] = useState(true);
   const [tab, setTab] = useState<Tab>("chat");
+  const wsTab = WS_TABS.includes(tab);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [openFilePath, setOpenFilePath] = useState<string | null>(null);
 
@@ -90,6 +93,78 @@ export function App() {
   const [currentWsPath, setCurrentWsPath] = useState<string | null>(null);
   const [switchingTo, setSwitchingTo] = useState<string | null>(null);
   const autoSelectedWs = useRef(false);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  const pendingChatRef = useRef(pendingChat);
+  pendingChatRef.current = pendingChat;
+
+  const [pingMs, setPingMs] = useState<number | null>(null);
+  const [loadingChat, setLoadingChat] = useState(false);
+  const pendingSendRef = useRef<{ text: string; time: number } | null>(null);
+
+  // Reset window scroll offset on keyboard dismiss across entire app
+  useEffect(() => {
+    const handleFocusOut = (e: FocusEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+        [50, 150, 300, 450, 600].forEach((delay) => {
+          setTimeout(() => {
+            window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+            if (document.body) document.body.scrollTop = 0;
+            if (document.documentElement) document.documentElement.scrollTop = 0;
+          }, delay);
+        });
+      }
+    };
+    window.addEventListener("focusout", handleFocusOut);
+    return () => window.removeEventListener("focusout", handleFocusOut);
+  }, []);
+
+  // Initialize theme on app mount
+  useEffect(() => {
+    const savedTheme = localStorage.getItem("agy_theme") || "obsidian";
+    document.documentElement.setAttribute("data-theme", savedTheme);
+  }, []);
+
+  // Listen for refresh-models event across panels
+  useEffect(() => {
+    const handleRefreshModels = (e: any) => {
+      if (Array.isArray(e.detail)) {
+        setModels(e.detail);
+      } else {
+        api.models().then((r) => setModels(r.models)).catch(() => {});
+      }
+    };
+    window.addEventListener("refresh-models", handleRefreshModels);
+    return () => window.removeEventListener("refresh-models", handleRefreshModels);
+  }, []);
+
+  // Lock background scroll when sidebar is open in workspace tabs
+  useEffect(() => {
+    if (sidebarOpen && wsTab) {
+      document.body.classList.add("sidebar-open-lock");
+    } else {
+      document.body.classList.remove("sidebar-open-lock");
+    }
+    return () => document.body.classList.remove("sidebar-open-lock");
+  }, [sidebarOpen, wsTab]);
+
+  // Latency ping monitor
+  useEffect(() => {
+    if (!authed) return;
+    const checkPing = async () => {
+      const t0 = performance.now();
+      try {
+        await api.models();
+        setPingMs(Math.round(performance.now() - t0));
+      } catch {}
+    };
+    checkPing();
+    const iv = setInterval(checkPing, 8000);
+    return () => clearInterval(iv);
+  }, [authed]);
 
   // Probe auth on load
   useEffect(() => {
@@ -144,8 +219,9 @@ export function App() {
       setModels(m.models);
       setWsFolders(wf.folders);
       if (s) setStats(s);
-      if (liveState && liveState.cascadeId) {
+      if (liveState && liveState.cascadeId && !pendingChatRef.current) {
         setState((prev) => {
+          if (pendingChatRef.current) return prev;
           if (!prev.cascadeId || prev.cascadeId === liveState.cascadeId) {
             return liveState;
           }
@@ -285,10 +361,54 @@ export function App() {
       return;
     }
 
+    const wasGenerating = stateRef.current?.generating;
+
     if (e.type === "state") {
-      setState(e.state);
-      if (e.state.cascadeId) setPendingChat(false);
+      if (pendingChatRef.current) {
+        if (!e.state.cascadeId) setState(EMPTY_STATE);
+        return;
+      }
+
+      let nextState = e.state;
+      if (pendingSendRef.current) {
+        if (Date.now() - pendingSendRef.current.time < 8000) {
+          const sentText = pendingSendRef.current.text;
+          const hasUserMsg = nextState.messages.some(
+            (m) => m.role === "user" && (m.text === sentText || m.text.includes(sentText))
+          );
+          if (!hasUserMsg) {
+            // Keep generating smoothly until the user message actually arrives in the trajectory!
+            nextState = {
+              ...nextState,
+              generating: true,
+              statusText: nextState.statusText && nextState.statusText !== "Idle" ? nextState.statusText : "Đang xử lý...",
+            };
+          } else {
+            pendingSendRef.current = null;
+          }
+        } else {
+          pendingSendRef.current = null;
+        }
+      }
+
+      if (wasGenerating && !nextState.generating) {
+        notifyAgentCompleted();
+      }
+
+      setState((prev) => {
+        if (prev.cascadeId && nextState.cascadeId && prev.cascadeId !== nextState.cascadeId) {
+          return prev;
+        }
+        return nextState;
+      });
     } else if (e.type === "state_update") {
+      if (pendingChatRef.current) return;
+      if (e.lastMessage?.role === "ask") {
+        playQuestionSound();
+      }
+      if (wasGenerating && !e.generating) {
+        notifyAgentCompleted();
+      }
       setState((prev) => {
         if (!prev || prev.cascadeId !== e.cascadeId || prev.messages.length === 0) return prev;
         const newMsgs = [...prev.messages];
@@ -296,12 +416,25 @@ export function App() {
         return { ...prev, messages: newMsgs, generating: e.generating, statusText: e.statusText };
       });
     } else if (e.type === "status") {
-      setState((prev) => ({
-        ...prev,
-        cascadeId: e.cascadeId,
-        generating: e.generating,
-        statusText: e.statusText,
-      }));
+      if (pendingChatRef.current) return;
+      if (pendingSendRef.current && Date.now() - pendingSendRef.current.time < 8000 && !e.generating) {
+        // Suppress premature idle status
+        return;
+      }
+      if (wasGenerating && !e.generating) {
+        notifyAgentCompleted();
+      }
+      setState((prev) => {
+        if (prev.cascadeId && e.cascadeId && prev.cascadeId !== e.cascadeId) {
+          return prev;
+        }
+        return {
+          ...prev,
+          cascadeId: e.cascadeId,
+          generating: e.generating,
+          statusText: e.statusText,
+        };
+      });
       if (!e.generating) {
         api.models().then((r) => setModels(r.models)).catch(() => {});
       }
@@ -345,6 +478,7 @@ export function App() {
   const send = async (text: string, images?: string[]) => {
     setError("");
     setPendingChat(false);
+    pendingSendRef.current = { text: text.trim(), time: Date.now() };
     setState((prev) => ({
       ...prev,
       generating: true,
@@ -353,6 +487,7 @@ export function App() {
     try {
       await api.send(text, images);
     } catch (e: any) {
+      pendingSendRef.current = null;
       setError(String(e?.message ?? e));
       setState((prev) => ({ ...prev, generating: false, statusText: "Idle" }));
     }
@@ -373,6 +508,7 @@ export function App() {
   };
 
   const switchCascade = async (id: string, wsUri?: string, wsName?: string) => {
+    setPendingChat(false);
     setTab("chat");
     const targetPath = uriToPath(wsUri ?? null);
     if (targetPath && currentWsPath && targetPath !== currentWsPath) {
@@ -380,9 +516,18 @@ export function App() {
       await api.openWorkspace(targetPath);
       return;
     }
-    const s = await api.state(id);
-    setState(s);
-    await api.switchCascade(id);
+    setLoadingChat(true);
+    try {
+      const [s] = await Promise.all([
+        api.state(id),
+        api.switchCascade(id),
+      ]);
+      setState(s);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setLoadingChat(false);
+    }
   };
 
   const selectWorkspace = (uri: string | null) => {
@@ -408,13 +553,21 @@ export function App() {
   };
 
   if (checking) {
-    return <div className="center muted">Loading…</div>;
+    return (
+      <div className="center app-initial-loading">
+        <div className="loading-logo-box">
+          <img src="/icon.png" alt="Antigravity Remote" className="loading-app-logo" />
+          <div className="loading-pulse-ring" />
+        </div>
+        <div className="loading-app-title">Antigravity Remote Plus</div>
+        <div className="loading-app-sub">Đang kết nối Antigravity IDE…</div>
+      </div>
+    );
   }
   if (!authed) {
     return <Login onLogin={handleLogin} />;
   }
 
-  const wsTab = WS_TABS.includes(tab);
   const cwd = uriToPath(activeWs);
 
   const pickPrompt = (
@@ -439,6 +592,7 @@ export function App() {
           <ChatPanel
             state={state}
             models={models}
+            loading={loadingChat}
             onSend={send}
             onCancel={async () => {
               setState((prev) => ({ ...prev, generating: false, statusText: "Idle" }));
@@ -447,6 +601,20 @@ export function App() {
               } catch {}
             }}
             onRevert={async (stepIndex: number) => {
+              setState((prev) => {
+                const targetIdx = prev.messages.findIndex(
+                  (m) => m.stepIndex === stepIndex
+                );
+                if (targetIdx >= 0) {
+                  return {
+                    ...prev,
+                    generating: false,
+                    statusText: "Idle",
+                    messages: prev.messages.slice(0, targetIdx + 1),
+                  };
+                }
+                return prev;
+              });
               await api.revert(stepIndex);
               const s = await api.state().catch(() => null);
               if (s && s.cascadeId) setState(s);
@@ -461,14 +629,28 @@ export function App() {
               }));
               api.slashCommand(name, modelFacingText, text);
             }}
-            onApprovePlan={(artifactUri, approved) => {
-              api.approvePlan(artifactUri, approved);
+            onMentionConversation={(conv, text) => {
+              setPendingChat(false);
+              setState((prev) => ({
+                ...prev,
+                generating: true,
+                statusText: "Đang xử lý...",
+              }));
+              return api.mentionConversation(conv, text);
+            }}
+            onApprovePlan={async (artifactUri, approved) => {
+              setState((prev) => ({
+                ...prev,
+                generating: true,
+                statusText: approved ? "Đang tiến hành theo kế hoạch..." : "Đã từ chối kế hoạch",
+              }));
+              await api.approvePlan(artifactUri, approved);
             }}
             onAnswerQuestion={(stepIndex, answers) => {
-              api.answerQuestion(stepIndex, answers);
+              return api.answerQuestion(stepIndex, answers);
             }}
             onSkipQuestion={(stepIndex) => {
-              api.skipQuestion(stepIndex);
+              return api.skipQuestion(stepIndex);
             }}
             onOpenFile={(path) => openFileInFiles(path)}
           />
@@ -496,13 +678,19 @@ export function App() {
           <button
             className="ghost icon-btn menu-btn"
             aria-label="Workspaces"
-            onClick={() => setSidebarOpen((v) => !v)}
-            disabled={!wsTab}
+            onClick={() => {
+              if (!wsTab) {
+                setTab("chat");
+                setSidebarOpen(true);
+              } else {
+                setSidebarOpen((v) => !v);
+              }
+            }}
           >
             <Icon name="menu" size={18} />
           </button>
           <div className="brand">
-            <Icon name="bot" size={18} className="brand-icon" />
+            <img src="/icon.png" className="brand-logo-img" alt="logo" />
             <span className="brand-text">Remote Plus</span>
           </div>
         </div>
@@ -521,7 +709,10 @@ export function App() {
             <button
               key={t.id}
               className={tab === t.id ? "active" : ""}
-              onClick={() => setTab(t.id)}
+              onClick={() => {
+                setTab(t.id);
+                setSidebarOpen(false);
+              }}
               title={t.label}
             >
               <Icon name={t.icon} size={15} />
@@ -535,7 +726,7 @@ export function App() {
 
       <div className="body">
         <div style={{ display: wsTab ? "contents" : "none" }}>
-          {sidebarOpen && (
+          {sidebarOpen && wsTab && (
             <div
               className="sidebar-overlay"
               onClick={() => setSidebarOpen(false)}
@@ -547,6 +738,7 @@ export function App() {
               wsFolders={wsFolders}
               windows={windows}
               activeWindowId={activeWindowId}
+              currentWsPath={currentWsPath}
               activeId={state.cascadeId}
               activeWs={activeWs}
               pendingChat={pendingChat}

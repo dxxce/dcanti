@@ -188,16 +188,7 @@ async function startAll(context: vscode.ExtensionContext) {
     }
 
     // Telegram (optional on Host).
-    if (cfg<boolean>("telegramEnabled", false)) {
-      const token = cfg<string>("telegramToken", "");
-      const chatId = cfg<string>("telegramChatId", "");
-      if (token) {
-        telegram = new TelegramBridge({ token, chatId, log }, chat);
-        await telegram.start();
-      } else {
-        log("[ext] telegram enabled but no token set");
-      }
-    }
+    await restartTelegram();
 
     updateStatusBar();
     const activePort = server.activePort;
@@ -291,11 +282,32 @@ function stopAll() {
   client = null;
   chat?.stop();
   chat = null;
+  terminals = null;
   ls = null;
   running = false;
   isHost = false;
   updateStatusBar();
   log("[ext] stopped");
+}
+
+async function restartTelegram() {
+  if (telegram) {
+    telegram.stop();
+    telegram = null;
+  }
+  if (!isHost || !chat) return;
+  if (cfg<boolean>("telegramEnabled", false)) {
+    const token = cfg<string>("telegramToken", "");
+    const chatId = cfg<string>("telegramChatId", "");
+    const notifyOnComplete = cfg<boolean>("telegramNotifyOnComplete", true);
+    if (token) {
+      telegram = new TelegramBridge({ token, chatId, notifyOnComplete, log }, chat);
+      await telegram.start();
+      log(`[ext] telegram started/reloaded (chatId: ${chatId || "any"}, notifyOnComplete: ${notifyOnComplete})`);
+    } else {
+      log("[ext] telegram enabled but no token set");
+    }
+  }
 }
 
 function openWeb() {
@@ -398,7 +410,20 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "antigravityRemotePlus.relaunchWithRemoteDebug",
       relaunchWithRemoteDebug
-    )
+    ),
+    vscode.workspace.onDidChangeConfiguration(async (e) => {
+      if (e.affectsConfiguration("antigravityRemotePlus")) {
+        if (
+          e.affectsConfiguration("antigravityRemotePlus.telegramEnabled") ||
+          e.affectsConfiguration("antigravityRemotePlus.telegramToken") ||
+          e.affectsConfiguration("antigravityRemotePlus.telegramChatId") ||
+          e.affectsConfiguration("antigravityRemotePlus.telegramNotifyOnComplete")
+        ) {
+          log("[ext] telegram configuration changed -> restarting telegram bridge");
+          await restartTelegram();
+        }
+      }
+    })
   );
 
   if (cfg<boolean>("autoStart", true)) {

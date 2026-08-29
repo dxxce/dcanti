@@ -1,29 +1,36 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, memo, useCallback } from "react";
 import { api, type ChatState, type ModelInfo } from "../api";
 import { Icon, type IconName } from "./Icon";
 import { Markdown } from "./Markdown";
+import hljs from "highlight.js/lib/common";
 
 interface Props {
   state: ChatState;
   models: ModelInfo[];
+  loading?: boolean;
   onSend: (text: string, images?: string[]) => void | Promise<void>;
   onCancel: () => void | Promise<void>;
   onRevert: (stepIndex: number) => void | Promise<void>;
   onSelectModel: (id: string) => void | Promise<void>;
   onSlashCommand: (name: string, modelFacingText: string, text: string) => void | Promise<void>;
-  onApprovePlan: (artifactUri: string, approved: boolean) => void | Promise<void>;
+  onMentionConversation?: (
+    conv: { id: string; title?: string; lastModifiedTime?: string },
+    text: string
+  ) => Promise<any> | void;
+  onApprovePlan: (artifactUri: string, approved: boolean) => Promise<any> | void;
   onAnswerQuestion: (
     stepIndex: number,
     answers: { selectedOptionIds: string[]; freeText?: string }[]
-  ) => void | Promise<void>;
-  onSkipQuestion: (stepIndex: number) => void | Promise<void>;
-  onOpenFile: (path: string) => void | Promise<void>;
+  ) => Promise<any> | void;
+  onSkipQuestion: (stepIndex: number) => Promise<any> | void;
+  onOpenFile: (path: string) => Promise<any> | void;
 }
 
 interface ChatMsg {
   id?: string;
   role: string;
   text: string;
+  ts?: number;
   kind?: string;
   detail?: string;
   images?: string[];
@@ -55,7 +62,11 @@ function toBlocks(messages: ChatMsg[]): Block[] {
   };
 
   messages.forEach((m, index) => {
-    if (m.role === "tool" || m.role === "system") {
+    if (m.kind === "error" || m.role === "error") {
+      flush();
+      const id = m.id || `msg-${index}-${m.stepIndex ?? ""}-error`;
+      blocks.push({ type: "msg", msg: m, index, id });
+    } else if (m.role === "tool" || m.role === "system") {
       if (buffer.length === 0) timelineStartIndex = index;
       buffer.push(m);
     } else {
@@ -74,6 +85,7 @@ const KIND_ICON: Record<string, IconName> = {
   run: "terminal",
   edit: "edit",
   task: "check",
+  browser: "browser",
   error: "close",
   system: "cpu",
   tool: "terminal",
@@ -82,11 +94,13 @@ const KIND_ICON: Record<string, IconName> = {
 export function ChatPanel({
   state,
   models,
+  loading = false,
   onSend,
   onCancel,
   onRevert,
   onSelectModel,
   onSlashCommand,
+  onMentionConversation,
   onApprovePlan,
   onAnswerQuestion,
   onSkipQuestion,
@@ -95,8 +109,8 @@ export function ChatPanel({
   const [text, setText] = useState("");
   const [pending, setPending] = useState<string[]>([]);
   const [modelOpen, setModelOpen] = useState(false);
-  const [slashOpen, setSlashOpen] = useState(false);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  const [attachModalOpen, setAttachModalOpen] = useState(false);
   const [slashCommands, setSlashCommands] = useState<
     { name: string; label: string; desc: string; modelFacingText: string }[]
   >([]);
@@ -194,18 +208,69 @@ export function ChatPanel({
   }, [state.messages, state.statusText, state.generating, visibleBlocks]);
 
   useEffect(() => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 180) + "px";
+    if (!text && taRef.current) {
+      taRef.current.style.height = "auto";
+    }
   }, [text]);
 
-  // Load the live slash-command catalog once (per cascade). The pending command
-  // (chosen from the menu) is applied only when the message is actually sent.
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setText(val);
+    e.target.style.height = "auto";
+    e.target.style.height = Math.min(e.target.scrollHeight, 180) + "px";
+
+    if (val.startsWith("/") && !val.includes(" ")) {
+      setPickerOpen("slash");
+      setPickerTab("slash");
+      setPickerSearch(val.slice(1));
+      setPickerSelectedIndex(0);
+    } else if (/@(\S*)$/.test(val)) {
+      const match = val.match(/@(\S*)$/);
+      setPickerOpen("mention");
+      setPickerTab("all");
+      setPickerSearch(match ? match[1] : "");
+      setPickerSelectedIndex(0);
+    } else if (pickerOpen && !val.startsWith("/") && !val.includes("@")) {
+      setPickerOpen(false);
+    }
+  };
+
+  // Pending mentions & slash commands
   const [pendingSlash, setPendingSlash] = useState<{
     name: string;
     modelFacingText: string;
   } | null>(null);
+  const [pendingMentions, setPendingMentions] = useState<{
+    id: string;
+    type: "file" | "folder" | "chat" | "slash";
+    label: string;
+    sublabel?: string;
+    value: string;
+    meta?: any;
+    modelFacingText?: string;
+  }[]>([]);
+
+  const [pickerOpen, setPickerOpen] = useState<false | "slash" | "mention">(false);
+  const [pickerTab, setPickerTab] = useState<"all" | "slash" | "file" | "folder" | "chat">("all");
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [pickerSelectedIndex, setPickerSelectedIndex] = useState(0);
+
+  // Lock background messages scroll when any composer modal is open
+  useEffect(() => {
+    const isAnyModalOpen = Boolean(modelOpen || pickerOpen || toolsMenuOpen || attachModalOpen);
+    if (isAnyModalOpen) {
+      document.body.classList.add("modal-scroll-lock");
+    } else {
+      document.body.classList.remove("modal-scroll-lock");
+    }
+    return () => {
+      document.body.classList.remove("modal-scroll-lock");
+    };
+  }, [modelOpen, pickerOpen, toolsMenuOpen, attachModalOpen]);
+
+  const [fileResults, setFileResults] = useState<{ name: string; path: string; type: "file" | "dir" }[]>([]);
+  const [trajectories, setTrajectories] = useState<{ id: string; title?: string; updatedAt?: string }[]>([]);
+
   useEffect(() => {
     let alive = true;
     api
@@ -226,6 +291,117 @@ export function ChatPanel({
     };
   }, [state.cascadeId]);
 
+  useEffect(() => {
+    if (!pickerOpen) return;
+    let alive = true;
+    if (pickerOpen === "mention" || pickerTab === "file" || pickerTab === "folder" || pickerTab === "all") {
+      api.searchFiles(pickerSearch, 40).then((res) => {
+        if (alive && Array.isArray(res?.entries)) {
+          setFileResults(res.entries);
+        }
+      }).catch(() => {});
+    }
+    if (pickerOpen === "mention" || pickerTab === "chat" || pickerTab === "all") {
+      api.trajectories().then((res) => {
+        if (alive && Array.isArray(res)) {
+          setTrajectories(res);
+        }
+      }).catch(() => {});
+    }
+    return () => {
+      alive = false;
+    };
+  }, [pickerOpen, pickerTab, pickerSearch]);
+
+  const pickerItems = useMemo(() => {
+    const q = pickerSearch.trim().toLowerCase();
+    const items: {
+      id: string;
+      type: "file" | "folder" | "chat" | "slash";
+      label: string;
+      sublabel?: string;
+      value: string;
+      meta?: any;
+      modelFacingText?: string;
+    }[] = [];
+
+    // 1. Slash commands
+    if (pickerOpen === "slash" || pickerTab === "slash" || pickerTab === "all") {
+      const matchedCmds = slashCommands.filter(
+        (c) => !q || c.name.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q)
+      );
+      matchedCmds.forEach((c) => {
+        items.push({
+          id: `slash-${c.name}`,
+          type: "slash",
+          label: `/${c.name}`,
+          sublabel: c.desc,
+          value: c.name,
+          modelFacingText: c.modelFacingText,
+        });
+      });
+    }
+
+    // 2. Folders & Files
+    if (pickerOpen === "mention" || pickerTab === "all" || pickerTab === "file" || pickerTab === "folder") {
+      fileResults.forEach((f) => {
+        if (f.type === "dir" && (pickerTab === "all" || pickerTab === "folder")) {
+          items.push({
+            id: `folder-${f.path}`,
+            type: "folder",
+            label: f.name + "/",
+            sublabel: f.path,
+            value: f.path,
+          });
+        } else if (f.type === "file" && (pickerTab === "all" || pickerTab === "file")) {
+          items.push({
+            id: `file-${f.path}`,
+            type: "file",
+            label: f.name,
+            sublabel: f.path,
+            value: f.path,
+          });
+        }
+      });
+    }
+
+    // 3. Past Chats
+    if (pickerOpen === "mention" || pickerTab === "all" || pickerTab === "chat") {
+      const matchedChats = trajectories.filter(
+        (t) => t.id !== state.cascadeId && (!q || (t.title && t.title.toLowerCase().includes(q)) || t.id.includes(q))
+      );
+      matchedChats.forEach((c) => {
+        items.push({
+          id: `chat-${c.id}`,
+          type: "chat",
+          label: c.title || "Cuộc trò chuyện",
+          sublabel: c.updatedAt ? new Date(c.updatedAt).toLocaleString() : c.id.slice(0, 8),
+          value: c.id,
+          meta: c,
+        });
+      });
+    }
+
+    return items;
+  }, [pickerOpen, pickerTab, pickerSearch, slashCommands, fileResults, trajectories, state.cascadeId]);
+
+  const selectPickerItem = (item: (typeof pickerItems)[number]) => {
+    if (item.type === "slash") {
+      setPendingSlash({ name: item.value, modelFacingText: item.modelFacingText || "" });
+      setText((cur) => cur.replace(/^\/\S*\s*/, ""));
+    } else {
+      setPendingMentions((prev) => {
+        if (prev.some((m) => m.id === item.id)) return prev;
+        return [...prev, item];
+      });
+      setText((cur) => cur.replace(/@\S*$/, ""));
+    }
+    setPickerOpen(false);
+    setPickerSearch("");
+    setPickerSelectedIndex(0);
+    taRef.current?.focus();
+  };
+
   const forceScrollBottom = () => {
     stickToBottom.current = true;
     scrollToBottomDirect();
@@ -235,68 +411,134 @@ export function ChatPanel({
 
   const submit = async () => {
     const t = text.trim();
-    if (!t && !pendingSlash && pending.length === 0) return;
+    const hasAttachments = pendingSlash || pendingMentions.length > 0 || pending.length > 0;
+    if (!t && !hasAttachments) return;
+
     const slash = pendingSlash;
+    const mentions = [...pendingMentions];
     const imgs = [...pending];
+
     setText("");
+    if (taRef.current) {
+      taRef.current.style.height = "auto";
+    }
     setPendingSlash(null);
+    setPendingMentions([]);
     setPending([]);
+    setPickerOpen(false);
     forceScrollBottom();
+
+    // 1. If Slash command
     if (slash) {
-      await onSlashCommand(slash.name, slash.modelFacingText, t);
+      let prompt = t;
+      if (mentions.length > 0) {
+        const mentionContext = mentions
+          .map((m) => {
+            if (m.type === "file") return `[Tham chiếu tệp: ${m.value}]`;
+            if (m.type === "folder") return `[Tham chiếu thư mục: ${m.value}]`;
+            if (m.type === "chat") return `[Tham chiếu phiên chat: ${m.label} (${m.value})]`;
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n");
+        prompt = prompt ? `${prompt}\n\n${mentionContext}` : mentionContext;
+      }
+      await onSlashCommand(slash.name, slash.modelFacingText, prompt);
       forceScrollBottom();
       return;
     }
-    await onSend(t, imgs.length > 0 ? imgs : undefined);
+
+    // 2. If single conversation mention and onMentionConversation is provided
+    const chatMention = mentions.find((m) => m.type === "chat");
+    const fileMentions = mentions.filter((m) => m.type === "file" || m.type === "folder");
+
+    if (chatMention && fileMentions.length === 0 && onMentionConversation) {
+      await onMentionConversation(
+        {
+          id: chatMention.value,
+          title: chatMention.label,
+          lastModifiedTime: chatMention.meta?.updatedAt,
+        },
+        t
+      );
+      forceScrollBottom();
+      return;
+    }
+
+    // 3. Regular send with formatted mention context
+    let fullPrompt = t;
+    if (mentions.length > 0) {
+      const refs = mentions
+        .map((m) => {
+          if (m.type === "file") return `@${m.value}`;
+          if (m.type === "folder") return `@${m.value}/`;
+          if (m.type === "chat") return `[Tham chiếu chat: ${m.label}]`;
+          return "";
+        })
+        .filter(Boolean)
+        .join(" ");
+      fullPrompt = fullPrompt ? `${refs} ${fullPrompt}` : refs;
+    }
+
+    await onSend(fullPrompt, imgs.length > 0 ? imgs : undefined);
     forceScrollBottom();
   };
 
   const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     for (const f of files) {
-      const reader = new FileReader();
-      reader.onload = () => setPending((cur) => [...cur, String(reader.result)]);
-      reader.readAsDataURL(f);
+      if (f.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = () => setPending((cur) => [...cur, String(reader.result)]);
+        reader.readAsDataURL(f);
+      } else {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const content = String(reader.result);
+          setText((prev) => (prev ? prev + "\n\n" : "") + `\`\`\`${f.name}\n${content}\n\`\`\``);
+        };
+        reader.readAsText(f);
+      }
     }
     e.target.value = "";
-  };
-
-  // Filter the slash menu by whatever follows the leading "/". The menu opens
-  // when the input starts with "/" and no space has been typed yet.
-  const slashQuery =
-    text.startsWith("/") && !text.includes(" ") ? text.slice(1).toLowerCase() : null;
-  const slashMatches =
-    slashQuery != null
-      ? slashCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery))
-      : [];
-  const showSlash = slashOpen && slashMatches.length > 0;
-
-  // Selecting a command does NOT send — it becomes a pending chip and clears the
-  // "/…" text so the user can type an accompanying message, then hit send.
-  const chooseSlash = (cmd: (typeof slashCommands)[number]) => {
-    setSlashOpen(false);
-    setPendingSlash({ name: cmd.name, modelFacingText: cmd.modelFacingText });
-    setText("");
-    taRef.current?.focus();
+    setAttachModalOpen(false);
+    setToolsMenuOpen(false);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (showSlash && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
-      e.preventDefault();
-      chooseSlash(slashMatches[0]);
-      return;
+    if (pickerOpen && pickerItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setPickerSelectedIndex((prev) => (prev + 1) % pickerItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setPickerSelectedIndex((prev) => (prev - 1 + pickerItems.length) % pickerItems.length);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        const target = pickerItems[pickerSelectedIndex] || pickerItems[0];
+        if (target) selectPickerItem(target);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setPickerOpen(false);
+        return;
+      }
     }
-    if (e.key === "Escape" && showSlash) {
-      setSlashOpen(false);
-      return;
-    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
   };
 
-  const removePending = (name: string) => {};
+  const removePendingMention = (id: string) => {
+    setPendingMentions((prev) => prev.filter((m) => m.id !== id));
+  };
 
   const [screenshotUri, setScreenshotUri] = useState<string | null>(null);
   const [screenshotLoading, setScreenshotLoading] = useState(false);
@@ -336,6 +578,10 @@ export function ChatPanel({
     }
   };
 
+  const handleRequestRevert = useCallback((stepIndex: number) => setConfirmRevertStepIndex(stepIndex), []);
+  const handleEditPlan = useCallback(() => taRef.current?.focus(), []);
+  const handlePreviewImage = useCallback((src: string) => setLightboxImage(src), []);
+
   const selectedModel =
     (localSelectedId ? models.find((m) => m.id === localSelectedId || m.label === localSelectedId) : null) ??
     models.find((m) => m.selected) ??
@@ -354,24 +600,144 @@ export function ChatPanel({
 
   const cleanModelName = (name: string) => {
     if (!name) return "";
-    return name.replace(/^MODEL_PLACEHOLDER_/, "").trim();
+    let s = name.replace(/^MODEL_PLACEHOLDER_/, "").trim();
+    s = s.replace(/^(Gemini|Claude|Google|Anthropic|OpenAI)\s+/i, "");
+    return s.trim();
   };
 
-  // Plan approval: last assistant message asks to confirm a plan, or a dedicated
-  // plan message is present.
-  const lastAssistant = [...state.messages]
-    .reverse()
-    .find((m) => m.role === "assistant");
-  const planPrompt =
-    !state.generating &&
-    ((lastAssistant && isPlanPrompt(lastAssistant.text)) ||
-      state.messages[state.messages.length - 1]?.role === "plan");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
 
-  // Auto-accept is temporarily DISABLED (it mis-fired) — plans are approved
-  // explicitly via the plan card buttons instead.
+  const exportChatToMarkdown = () => {
+    if (state.messages.length === 0) return;
+    const lines = [`# Trajectory Session: ${state.cascadeId || "Chat"}\n`];
+    state.messages.forEach((m) => {
+      const roleName =
+        m.role === "user"
+          ? "### 👤 User"
+          : m.role === "assistant"
+          ? "### 🤖 Assistant"
+          : `### 📌 ${m.role}`;
+      lines.push(`${roleName}\n\n${m.text}\n`);
+      if (m.detail) {
+        lines.push(`\`\`\`\n${m.detail}\n\`\`\`\n`);
+      }
+    });
+    const blob = new Blob([lines.join("\n---\n\n")], {
+      type: "text/markdown;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `trajectory-${state.cascadeId || Date.now()}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const quickPrompts = [
+    {
+      label: "Review Code",
+      icon: "search" as IconName,
+      prompt: "Hãy review toàn bộ code vừa thay đổi và tìm các lỗi tiềm ẩn",
+    },
+    {
+      label: "Viết Unit Test",
+      icon: "code" as IconName,
+      prompt: "Hãy viết unit test đầy đủ cho các module vừa triển khai",
+    },
+    {
+      label: "Tối ưu Code",
+      icon: "zap" as IconName,
+      prompt: "Hãy tối ưu hiệu năng và dọn dẹp code sạch đẹp hơn",
+    },
+    {
+      label: "Giải thích",
+      icon: "sparkles" as IconName,
+      prompt: "Hãy giải thích chi tiết các bước xử lý vừa rồi",
+    },
+    {
+      label: "Sửa lỗi",
+      icon: "check" as IconName,
+      prompt: "Kiểm tra và sửa toàn bộ lỗi lint / build hiện tại",
+    },
+  ];
+
+  const filteredBlocks = useMemo(() => {
+    if (!searchQuery.trim()) return visibleBlocks;
+    const q = searchQuery.toLowerCase();
+    return visibleBlocks.filter((b) => {
+      if (b.type === "msg") {
+        return (
+          String(b.msg?.text || "").toLowerCase().includes(q) ||
+          String(b.msg?.detail || "").toLowerCase().includes(q)
+        );
+      }
+      return b.steps.some(
+        (s) =>
+          String(s?.text || "").toLowerCase().includes(q) ||
+          String(s?.detail || "").toLowerCase().includes(q)
+      );
+    });
+  }, [visibleBlocks, searchQuery]);
 
   return (
     <section className="chat">
+      {loading && (
+        <div className="chat-loading-overlay">
+          <Icon name="spinner" size={34} className="spin text-accent" />
+          <div className="chat-loading-text">Đang tải đoạn chat…</div>
+        </div>
+      )}
+      <div className="chat-top-bar">
+        <div className="chat-top-left">
+          <span className="chat-session-badge">
+            <Icon name="chat" size={13} />
+            <span>{state.cascadeId ? `${state.cascadeId.slice(0, 8)}…` : "Phiên làm việc"}</span>
+          </span>
+          <span className="chat-msg-count">{state.messages.length} tin nhắn</span>
+        </div>
+        <div className="chat-top-right">
+          <button
+            type="button"
+            className={"ghost sm icon-btn" + (showSearch ? " active" : "")}
+            onClick={() => setShowSearch(!showSearch)}
+            title="Tìm kiếm trong cuộc trò chuyện"
+          >
+            <Icon name="search" size={13} />
+          </button>
+          <button
+            type="button"
+            className="ghost sm icon-btn"
+            onClick={exportChatToMarkdown}
+            title="Xuất lịch sử chat sang Markdown (.md)"
+          >
+            <Icon name="download" size={13} />
+          </button>
+        </div>
+      </div>
+
+      {showSearch && (
+        <div className="chat-search-bar">
+          <Icon name="search" size={13} className="chat-search-icon" />
+          <input
+            type="text"
+            placeholder="Tìm kiếm nội dung tin nhắn, lệnh terminal, file..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            autoFocus
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              className="ghost icon-btn sm"
+              onClick={() => setSearchQuery("")}
+            >
+              <Icon name="close" size={12} />
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="messages" ref={listRef} onScroll={onScroll}>
         <div className="messages-inner">
           {state.messages.length === 0 && !state.generating && (
@@ -395,8 +761,8 @@ export function ChatPanel({
             </div>
           )}
 
-          {visibleBlocks.map((b, i) => {
-            const isLastBlock = i === visibleBlocks.length - 1;
+          {filteredBlocks.map((b, i) => {
+            const isLastBlock = i === filteredBlocks.length - 1;
             return b.type === "timeline" ? (
               <Timeline
                 key={b.id}
@@ -409,13 +775,13 @@ export function ChatPanel({
               <MessageRow
                 key={b.id}
                 msg={b.msg}
-                onRequestRevert={(stepIndex) => setConfirmRevertStepIndex(stepIndex)}
+                onRequestRevert={handleRequestRevert}
                 onApprovePlan={onApprovePlan}
                 onAnswerQuestion={onAnswerQuestion}
                 onSkipQuestion={onSkipQuestion}
                 onOpenFile={onOpenFile}
-                onEditPlan={() => taRef.current?.focus()}
-                onPreviewImage={(src) => setLightboxImage(src)}
+                onEditPlan={handleEditPlan}
+                onPreviewImage={handlePreviewImage}
               />
             );
           })}
@@ -448,21 +814,137 @@ export function ChatPanel({
             <Icon name="arrowDown" size={16} />
           </button>
         )}
+
         <div className="composer-inner">
+          {/* Quick Prompts Bar */}
+          <div className="quick-prompts-bar">
+            {quickPrompts.map((qp, idx) => (
+              <button
+                key={idx}
+                type="button"
+                className="quick-prompt-chip"
+                onClick={() => {
+                  setText(qp.prompt);
+                  taRef.current?.focus();
+                }}
+              >
+                <Icon name={qp.icon} size={12} />
+                <span>{qp.label}</span>
+              </button>
+            ))}
+          </div>
+
           <div className="composer-box">
-            {showSlash && (
-              <div className="slash-menu">
-                {slashMatches.map((c) => (
-                  <button
-                    key={c.name}
-                    className="slash-item"
-                    onClick={() => chooseSlash(c)}
-                  >
-                    <span className="slash-item-name">{c.label}</span>
-                    <span className="slash-item-desc">{c.desc}</span>
-                  </button>
-                ))}
-              </div>
+            {/* Slash & Mention Picker Menu */}
+            {pickerOpen && (
+              <>
+                <div
+                  className="picker-backdrop"
+                  onClick={() => setPickerOpen(false)}
+                  onTouchStart={() => setPickerOpen(false)}
+                />
+                <div className="command-mention-picker">
+                  <div className="picker-header">
+                    <div className="picker-tabs">
+                      <button
+                        type="button"
+                        className={"picker-tab" + (pickerTab === "all" ? " active" : "")}
+                        onClick={() => setPickerTab("all")}
+                      >
+                        <Icon name="search" size={12} />
+                        <span>Tất cả</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={"picker-tab" + (pickerTab === "slash" ? " active" : "")}
+                        onClick={() => setPickerTab("slash")}
+                      >
+                        <Icon name="zap" size={12} />
+                        <span>Lệnh (/)</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={"picker-tab" + (pickerTab === "file" ? " active" : "")}
+                        onClick={() => setPickerTab("file")}
+                      >
+                        <Icon name="file" size={12} />
+                        <span>Tệp tin</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={"picker-tab" + (pickerTab === "folder" ? " active" : "")}
+                        onClick={() => setPickerTab("folder")}
+                      >
+                        <Icon name="folder" size={12} />
+                        <span>Thư mục</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={"picker-tab" + (pickerTab === "chat" ? " active" : "")}
+                        onClick={() => setPickerTab("chat")}
+                      >
+                        <Icon name="chat" size={12} />
+                        <span>Đoạn chat</span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      className="picker-close"
+                      onClick={() => setPickerOpen(false)}
+                      title="Đóng (Esc)"
+                    >
+                      <Icon name="close" size={13} />
+                    </button>
+                  </div>
+
+                  <ul className="picker-list">
+                    {pickerItems.length === 0 ? (
+                      <li className="picker-empty">Không tìm thấy kết quả phù hợp</li>
+                    ) : (
+                      pickerItems.map((item, idx) => {
+                        const isSelected = idx === pickerSelectedIndex;
+                        let iconName: IconName = "file";
+                        if (item.type === "slash") iconName = "zap";
+                        else if (item.type === "folder") iconName = "folder";
+                        else if (item.type === "chat") iconName = "chat";
+
+                        let badgeText = "Tệp";
+                        if (item.type === "slash") badgeText = "Lệnh";
+                        else if (item.type === "folder") badgeText = "Thư mục";
+                        else if (item.type === "chat") badgeText = "Chat";
+
+                        return (
+                          <li key={item.id}>
+                            <button
+                              type="button"
+                              className={"picker-item" + (isSelected ? " active" : "")}
+                              onClick={() => selectPickerItem(item)}
+                              onMouseEnter={() => setPickerSelectedIndex(idx)}
+                            >
+                              <div className="picker-item-left">
+                                <span className={"picker-icon-badge " + item.type}>
+                                  <Icon name={iconName} size={13} />
+                                </span>
+                                <div className="picker-item-info">
+                                  <span className={"picker-item-title" + (item.type === "slash" ? " mono" : "")}>
+                                    {item.label}
+                                  </span>
+                                  {item.sublabel && (
+                                    <span className="picker-item-desc">{item.sublabel}</span>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="picker-item-right">
+                                <span className={"picker-tag " + item.type}>{badgeText}</span>
+                              </div>
+                            </button>
+                          </li>
+                        );
+                      })
+                    )}
+                  </ul>
+                </div>
+              </>
             )}
             <div className="composer-top">
               <div className="model-picker">
@@ -475,7 +957,7 @@ export function ChatPanel({
                       try {
                         const m = await api.models();
                         if (Array.isArray(m?.models)) {
-                          // refresh models from API
+                          window.dispatchEvent(new CustomEvent("refresh-models", { detail: m.models }));
                         }
                       } catch {}
                     }
@@ -503,6 +985,10 @@ export function ChatPanel({
                     <div
                       className="picker-backdrop"
                       onClick={() => {
+                        setModelOpen(false);
+                        setActiveGroupKey(null);
+                      }}
+                      onTouchStart={() => {
                         setModelOpen(false);
                         setActiveGroupKey(null);
                       }}
@@ -667,30 +1153,51 @@ export function ChatPanel({
               )}
             </div>
 
-            {pendingSlash && (
+            {(pendingSlash || pendingMentions.length > 0 || pending.length > 0) && (
               <div className="attach-chips">
-                <span className="attach-chip slash" title={pendingSlash.name}>
-                  <Icon name="terminal" size={12} />
-                  <span className="attach-chip-name">/{pendingSlash.name}</span>
-                  <button
-                    className="attach-chip-x"
-                    onClick={() => setPendingSlash(null)}
-                    title="Bỏ lệnh"
-                  >
-                    <Icon name="close" size={11} />
-                  </button>
-                </span>
-              </div>
-            )}
+                {pendingSlash && (
+                  <span className="attach-chip slash" title={pendingSlash.name}>
+                    <Icon name="zap" size={12} />
+                    <span className="attach-chip-name">/{pendingSlash.name}</span>
+                    <button
+                      type="button"
+                      className="attach-chip-x"
+                      onClick={() => setPendingSlash(null)}
+                      title="Bỏ lệnh"
+                    >
+                      <Icon name="close" size={11} />
+                    </button>
+                  </span>
+                )}
 
-            {pending.length > 0 && (
-              <div className="attach-chips">
+                {pendingMentions.map((m) => {
+                  let iconName: IconName = "file";
+                  if (m.type === "folder") iconName = "folder";
+                  else if (m.type === "chat") iconName = "chat";
+
+                  return (
+                    <span className={"attach-chip " + m.type} key={m.id} title={m.value}>
+                      <Icon name={iconName} size={12} />
+                      <span className="attach-chip-name">{m.label}</span>
+                      <button
+                        type="button"
+                        className="attach-chip-x"
+                        onClick={() => removePendingMention(m.id)}
+                        title="Bỏ đính kèm"
+                      >
+                        <Icon name="close" size={11} />
+                      </button>
+                    </span>
+                  );
+                })}
+
                 {pending.map((p, i) => (
                   <span className="attach-chip image" key={i}>
                     <img src={p} alt="" className="attach-chip-thumb" />
                     <button
+                      type="button"
                       className="attach-chip-x"
-                      onClick={() => setPending(cur => cur.filter((_, idx) => idx !== i))}
+                      onClick={() => setPending((cur) => cur.filter((_, idx) => idx !== i))}
                       title="Xóa ảnh"
                     >
                       <Icon name="close" size={11} />
@@ -700,72 +1207,230 @@ export function ChatPanel({
               </div>
             )}
 
-
-
             <textarea
               ref={taRef}
               value={text}
-              onChange={(e) => {
-                setText(e.target.value);
-                // Open the slash menu as soon as the line starts with "/".
-                setSlashOpen(e.target.value.startsWith("/"));
-              }}
+              onChange={handleTextChange}
               onKeyDown={onKeyDown}
-              placeholder="Nhắn tin cho AI…  (Enter để gửi, Shift+Enter xuống dòng)"
+              onBlur={() => {
+                [50, 150, 300, 450, 600].forEach((delay) => {
+                  setTimeout(() => {
+                    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+                    if (document.body) document.body.scrollTop = 0;
+                    if (document.documentElement) document.documentElement.scrollTop = 0;
+                  }, delay);
+                });
+              }}
+              placeholder="Nhắn tin cho AI… (Gõ / để dùng lệnh, @ để nhắc file/thư mục/chat)"
               rows={1}
             />
 
             <div className="composer-actions">
-
-
-              <div className="tools-menu-wrapper">
+              <div className="composer-quick-actions">
                 <button
-                  className={"ghost icon-btn composer-tools-trigger " + (toolsMenuOpen ? "active" : "")}
-                  title="Công cụ & Tiện ích"
-                  onClick={() => setToolsMenuOpen(!toolsMenuOpen)}
+                  type="button"
+                  className={"composer-quick-btn" + (pickerOpen ? " active" : "")}
+                  onClick={() => {
+                    if (pickerOpen) {
+                      setPickerOpen(false);
+                    } else {
+                      setPickerOpen("mention");
+                      setPickerTab("all");
+                      setPickerSearch("");
+                      setPickerSelectedIndex(0);
+                    }
+                  }}
+                  title="Danh sách Lệnh & Nhắc tới (/ @)"
                 >
-                  <Icon name="plus" size={18} />
+                  <Icon name="zap" size={13} />
+                  <span>Lệnh</span>
                 </button>
-                <label className="ghost icon-btn composer-tools-trigger" title="Tải ảnh lên" style={{ marginLeft: 4, cursor: "pointer" }}>
-                  <input type="file" multiple accept="image/*" style={{ display: "none" }} onChange={onUpload} />
-                  <Icon name="upload" size={16} />
-                </label>
 
-                {toolsMenuOpen && (
-                  <>
-                    <div className="menu-backdrop" onClick={() => setToolsMenuOpen(false)} />
-                    <div className="tools-dropdown-menu">
-                      <div className="tools-menu-header">Công cụ & Tiện ích</div>
-                      
+                <button
+                  type="button"
+                  className={"composer-quick-btn" + (toolsMenuOpen ? " active" : "")}
+                  onClick={() => {
+                    setToolsMenuOpen(!toolsMenuOpen);
+                    setAttachModalOpen(false);
+                  }}
+                  title="Công cụ & Tiện ích"
+                >
+                  <Icon name="plus" size={13} />
+                  <span>Tiện ích</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={"composer-quick-btn" + (attachModalOpen ? " active" : "")}
+                  onClick={() => {
+                    setAttachModalOpen(!attachModalOpen);
+                    setToolsMenuOpen(false);
+                  }}
+                  title="Đính kèm hình ảnh & tệp tin"
+                >
+                  <Icon name="attach" size={13} />
+                  <span>Đính kèm</span>
+                </button>
+              </div>
+
+              {/* Tools Menu Popup */}
+              {toolsMenuOpen && (
+                <>
+                  <div
+                    className="menu-backdrop"
+                    onClick={() => setToolsMenuOpen(false)}
+                    onTouchStart={() => setToolsMenuOpen(false)}
+                  />
+                  <div className="tools-dropdown-menu">
+                    <div className="tools-menu-header">
+                      <Icon name="sparkles" size={13} />
+                      <span>Công cụ & Tiện ích</span>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="tools-menu-item"
+                      disabled={screenshotLoading}
+                      onClick={async () => {
+                        setToolsMenuOpen(false);
+                        await captureScreenshot();
+                      }}
+                    >
+                      <Icon
+                        name={screenshotLoading ? "spinner" : "camera"}
+                        size={16}
+                        className={screenshotLoading ? "spin" : ""}
+                      />
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Chụp màn hình IDE / Mac</span>
+                        <span className="tools-menu-item-desc">Chụp nhanh ảnh màn hình và đính kèm vào tin nhắn</span>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="tools-menu-item"
+                      onClick={() => {
+                        setToolsMenuOpen(false);
+                        exportChatToMarkdown();
+                      }}
+                    >
+                      <Icon name="file" size={16} />
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Xuất đoạn chat (.md)</span>
+                        <span className="tools-menu-item-desc">Lưu toàn bộ lịch sử trò chuyện sang file Markdown</span>
+                      </div>
+                    </button>
+
+                    {pending.length > 0 && (
                       <button
-                        className="tools-menu-item"
-                        disabled={screenshotLoading}
-                        onClick={async () => {
+                        type="button"
+                        className="tools-menu-item danger"
+                        onClick={() => {
                           setToolsMenuOpen(false);
-                          await captureScreenshot();
+                          setPending([]);
                         }}
                       >
-                        <Icon name={screenshotLoading ? "spinner" : "camera"} size={16} className={screenshotLoading ? "spin" : ""} />
+                        <Icon name="trash" size={16} />
                         <div className="tools-menu-item-info">
-                          <span className="tools-menu-item-title">Chụp màn hình Mac</span>
-                          <span className="tools-menu-item-desc">Chụp toàn màn hình Mac và gửi ngay vào đoạn chat</span>
+                          <span className="tools-menu-item-title">Xóa tất cả ảnh đính kèm</span>
+                          <span className="tools-menu-item-desc">Hủy {pending.length} ảnh đang chờ gửi</span>
                         </div>
                       </button>
+                    )}
+                  </div>
+                </>
+              )}
 
-                      {pending.length > 0 && (
-                        <button className="tools-menu-item danger" onClick={() => { setToolsMenuOpen(false); setPending([]); }}>
-                          <Icon name="close" size={16} />
-                          <div className="tools-menu-item-info">
-                            <span className="tools-menu-item-title">Xóa tất cả đính kèm</span>
-                            <span className="tools-menu-item-desc">Loại bỏ {pending.length} tệp đã chọn khỏi danh sách</span>
-                          </div>
-                        </button>
-                      )}
+              {/* Attachment Custom Action Sheet / Modal */}
+              {attachModalOpen && (
+                <>
+                  <div
+                    className="menu-backdrop"
+                    onClick={() => setAttachModalOpen(false)}
+                    onTouchStart={() => setAttachModalOpen(false)}
+                  />
+                  <div className="attach-dropdown-menu">
+                    <div className="tools-menu-header">
+                      <Icon name="attach" size={13} />
+                      <span>Đính kèm tệp tin &amp; Hình ảnh</span>
+                    </div>
 
+                    <label className="tools-menu-item" style={{ cursor: "pointer" }}>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        capture="environment"
+                        style={{ display: "none" }}
+                        onChange={onUpload}
+                      />
+                      <div className="tools-menu-item-icon-box camera">
+                        <Icon name="camera" size={18} />
                       </div>
-                    </>
-                  )}
-                </div>
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Chụp ảnh trực tiếp</span>
+                        <span className="tools-menu-item-desc">Sử dụng máy ảnh thiết bị chụp hình</span>
+                      </div>
+                    </label>
+
+                    <label className="tools-menu-item" style={{ cursor: "pointer" }}>
+                      <input
+                        type="file"
+                        multiple
+                        accept="image/*"
+                        style={{ display: "none" }}
+                        onChange={onUpload}
+                      />
+                      <div className="tools-menu-item-icon-box gallery">
+                        <Icon name="image" size={18} />
+                      </div>
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Thư viện hình ảnh</span>
+                        <span className="tools-menu-item-desc">Chọn một hoặc nhiều ảnh từ thiết bị</span>
+                      </div>
+                    </label>
+
+                    <label className="tools-menu-item" style={{ cursor: "pointer" }}>
+                      <input
+                        type="file"
+                        multiple
+                        accept=".txt,.md,.json,.js,.ts,.tsx,.jsx,.html,.css,.py,.go,.rs,.sh,.log,.yaml,.yml,.sql,.env"
+                        style={{ display: "none" }}
+                        onChange={onUpload}
+                      />
+                      <div className="tools-menu-item-icon-box doc">
+                        <Icon name="file" size={18} />
+                      </div>
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Tệp tài liệu &amp; Mã nguồn</span>
+                        <span className="tools-menu-item-desc">Đính kèm text, JSON, code hoặc log vào chat</span>
+                      </div>
+                    </label>
+
+                    <button
+                      type="button"
+                      className="tools-menu-item"
+                      disabled={screenshotLoading}
+                      onClick={async () => {
+                        setAttachModalOpen(false);
+                        await captureScreenshot();
+                      }}
+                    >
+                      <div className="tools-menu-item-icon-box screen">
+                        <Icon
+                          name={screenshotLoading ? "spinner" : "terminal"}
+                          size={18}
+                          className={screenshotLoading ? "spin" : ""}
+                        />
+                      </div>
+                      <div className="tools-menu-item-info">
+                        <span className="tools-menu-item-title">Chụp màn hình IDE / Mac</span>
+                        <span className="tools-menu-item-desc">Chụp nhanh không gian làm việc máy tính từ xa</span>
+                      </div>
+                    </button>
+                  </div>
+                </>
+              )}
 
               <div className="spacer" />
 
@@ -931,6 +1596,15 @@ function ImageViewer({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    if (e.deltaY < 0) {
+      zoomIn();
+    } else {
+      zoomOut();
+    }
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
     if (scale <= 1) return;
     setIsDragging(true);
@@ -943,7 +1617,19 @@ function ImageViewer({
   const handleMouseUp = () => setIsDragging(false);
 
   const lastTap = useRef<number>(0);
+  const pinchDist = useRef<number | null>(null);
+  const pinchStartScale = useRef<number>(1);
+
   const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      pinchDist.current = dist;
+      pinchStartScale.current = scale;
+      return;
+    }
     const now = Date.now();
     if (now - lastTap.current < 300) {
       handleDoubleClick();
@@ -956,11 +1642,27 @@ function ImageViewer({
       dragStart.current = { x: e.touches[0].clientX - pos.x, y: e.touches[0].clientY - pos.y };
     }
   };
+
   const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 2 && pinchDist.current != null) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const ratio = dist / pinchDist.current;
+      const nextScale = Math.min(Math.max(Number((pinchStartScale.current * ratio).toFixed(1)), 1), 4);
+      setScale(nextScale);
+      if (nextScale === 1) setPos({ x: 0, y: 0 });
+      return;
+    }
     if (!isDragging || e.touches.length !== 1) return;
     setPos({ x: e.touches[0].clientX - dragStart.current.x, y: e.touches[0].clientY - dragStart.current.y });
   };
-  const handleTouchEnd = () => setIsDragging(false);
+
+  const handleTouchEnd = () => {
+    setIsDragging(false);
+    pinchDist.current = null;
+  };
 
   return (
     <div className="img-viewer-backdrop" onClick={onClose} ref={containerRef}>
@@ -981,7 +1683,7 @@ function ImageViewer({
             <button className="icon-btn sm" onClick={zoomIn} disabled={scale >= 4} title="Phóng to (+)">
               <Icon name="plus" size={14} />
             </button>
-            <button className="icon-btn sm" onClick={toggleFullscreen} title="Toàn màn hình">
+            <button className="icon-btn sm btn-fullscreen" onClick={toggleFullscreen} title="Toàn màn hình">
               <Icon name="eye" size={14} />
             </button>
             <a
@@ -1002,6 +1704,7 @@ function ImageViewer({
 
         <div
           className={`img-viewer-stage ${scale > 1 ? "is-zoomed" : ""} ${isDragging ? "is-dragging" : ""}`}
+          onWheel={handleWheel}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
@@ -1099,8 +1802,9 @@ function groupModels(list: ModelInfo[], selectedId?: string): ModelGroup[] {
 
   const ORDER = [
     "Gemini 3.7 Flash",
-    "Gemini 3.6 Flash",
+    "Gemini 3.7 Flash (Thinking)",
     "Gemini 3.5 Flash",
+    "Gemini 3.6 Flash",
     "Gemini 3.1 Pro",
     "Claude Sonnet 4.6 (Thinking)",
     "Claude Opus 4.6 (Thinking)",
@@ -1113,7 +1817,10 @@ function groupModels(list: ModelInfo[], selectedId?: string): ModelGroup[] {
     const levelRank: Record<string, number> = { High: 1, Medium: 2, Low: 3, "": 4 };
     val.variants.sort((a, b) => (levelRank[a.level] || 9) - (levelRank[b.level] || 9));
 
-    const sel = val.variants.find((v) => v.selected) || val.variants[0];
+    const sel =
+      val.variants.find((v) => v.selected) ||
+      val.variants.find((v) => v.level === "High") ||
+      val.variants[0];
     const isSelected = val.variants.some((v) => v.selected);
     const fraction =
       sel.remainingFraction ??
@@ -1206,13 +1913,13 @@ const TIMELINE_VISIBLE = 5;
 function getStepKey(s: ChatMsg, index: number): string {
   if (s.id) return s.id;
   if (s.stepIndex != null) return `step-${s.stepIndex}`;
-  const textSig = (s.text || "").slice(0, 30);
+  const textSig = String(s?.text || "").slice(0, 30);
   const dur = s.meta?.durationMs ?? "";
   const tok = s.meta?.tokens ?? "";
   return `step-${index}-${s.kind || ""}-${textSig}-${dur}-${tok}`;
 }
 
-function Timeline({
+const Timeline = memo(function Timeline({
   steps,
   live,
   statusText,
@@ -1286,7 +1993,7 @@ function Timeline({
       </ul>
     </div>
   );
-}
+});
 
 // Format a duration in ms as a compact "1.2s" / "850ms" / "2m 3s".
 function fmtDuration(ms: number): string {
@@ -1297,7 +2004,30 @@ function fmtDuration(ms: number): string {
   return `${m}m ${Math.round(s - m * 60)}s`;
 }
 
-function TimelineStep({
+// Format message timestamp in hh:mm (or dd/mm hh:mm if not today).
+function fmtMsgTime(ts?: number): string {
+  if (!ts || !Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const isToday =
+    d.getDate() === now.getDate() &&
+    d.getMonth() === now.getMonth() &&
+    d.getFullYear() === now.getFullYear();
+
+  const hours = String(d.getHours()).padStart(2, "0");
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const timeStr = `${hours}:${minutes}`;
+
+  if (isToday) {
+    return timeStr;
+  }
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  return `${day}/${month} ${timeStr}`;
+}
+
+const TimelineStep = memo(function TimelineStep({
   step,
   open,
   onToggle,
@@ -1361,16 +2091,165 @@ function TimelineStep({
         </span>
       </span>
       {open && hasDetail && (
-        <div className="tstep-detail-box">
-          <pre className="tstep-detail">{detail}</pre>
-        </div>
+        <StepDetailBox step={step} detail={detail!} onOpenFile={onOpenFile} />
       )}
     </li>
   );
-}
+});
+
+const StepDetailBox = memo(function StepDetailBox({
+  step,
+  detail,
+  onOpenFile,
+}: {
+  step: ChatMsg;
+  detail: string;
+  onOpenFile?: (path: string) => void | Promise<void>;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = (text: string) => {
+    navigator.clipboard?.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const isTerminal = step.kind === "run" || String(step.meta?.type || "") === "RUN_COMMAND";
+  const isEdit =
+    step.kind === "edit" ||
+    /replace|write_to_file|code_action/i.test(String(step.meta?.type || ""));
+  const editUri = String(step.meta?.artifactUri ?? "");
+  const editPath = editUri
+    ? decodeURIComponent(editUri.replace(/^file:\/\//, ""))
+    : "";
+
+  // Highlight helper
+  const renderHighlighted = (code: string, lang = "") => {
+    try {
+      if (lang && hljs.getLanguage(lang)) {
+        return hljs.highlight(code, { language: lang }).value;
+      }
+      return hljs.highlightAuto(code).value;
+    } catch {
+      return code
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+  };
+
+  if (isTerminal) {
+    let cmd = "";
+    let output = detail;
+    const match = detail.match(/^\$\s*(.+?)(?:\n\n|\n(?=[^\$]))([\s\S]*)$/);
+    if (match) {
+      cmd = match[1].trim();
+      output = match[2].trim();
+    } else if (detail.startsWith("$ ")) {
+      cmd = detail.slice(2).trim();
+      output = "";
+    }
+
+    return (
+      <div className="tstep-detail-box terminal-detail">
+        <div className="tstep-detail-header">
+          <span className="tstep-detail-tag">
+            <Icon name="terminal" size={12} /> <span>Terminal</span>
+          </span>
+          <button
+            className="code-copy"
+            onClick={() => copy(cmd ? `$ ${cmd}\n\n${output}` : output)}
+          >
+            <Icon name={copied ? "check" : "file"} size={12} />
+            <span>{copied ? "Đã chép" : "Sao chép"}</span>
+          </button>
+        </div>
+        {cmd && (
+          <div className="tstep-cmd-line">
+            <span className="cmd-prompt">$</span>
+            <span className="cmd-text">{cmd}</span>
+          </div>
+        )}
+        {output && (
+          <pre className="tstep-term-output hljs">
+            <code
+              dangerouslySetInnerHTML={{
+                __html: renderHighlighted(output, "bash"),
+              }}
+            />
+          </pre>
+        )}
+      </div>
+    );
+  }
+
+  if (isEdit) {
+    const isDiff =
+      detail.includes("--- Target:\n") || detail.includes("+++ Replacement:\n");
+    const langMatch = editPath.match(/\.([a-zA-Z0-9]+)$/);
+    const lang = langMatch ? langMatch[1] : "typescript";
+
+    return (
+      <div className="tstep-detail-box edit-detail">
+        <div className="tstep-detail-header">
+          <div className="tstep-detail-file">
+            <Icon name="edit" size={12} />
+            {editPath ? (
+              <button
+                type="button"
+                className="tstep-file-link"
+                title="Mở trong tab Files"
+                onClick={() => onOpenFile && onOpenFile(editPath)}
+              >
+                <span>{editPath}</span>
+              </button>
+            ) : (
+              <span>Chỉnh sửa tệp</span>
+            )}
+          </div>
+          <button className="code-copy" onClick={() => copy(detail)}>
+            <Icon name={copied ? "check" : "file"} size={12} />
+            <span>{copied ? "Đã chép" : "Sao chép"}</span>
+          </button>
+        </div>
+        {isDiff ? (
+          <div className="tstep-diff-box">
+            <pre className="tstep-diff-content">
+              <code>{detail}</code>
+            </pre>
+          </div>
+        ) : (
+          <pre className="tstep-code-body hljs">
+            <code
+              dangerouslySetInnerHTML={{
+                __html: renderHighlighted(detail, lang),
+              }}
+            />
+          </pre>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="tstep-detail-box generic-detail">
+      <div className="tstep-detail-header">
+        <span className="tstep-detail-tag">
+          <Icon name="file" size={12} /> <span>Chi tiết</span>
+        </span>
+        <button className="code-copy" onClick={() => copy(detail)}>
+          <Icon name={copied ? "check" : "file"} size={12} />
+          <span>{copied ? "Đã chép" : "Sao chép"}</span>
+        </button>
+      </div>
+      <pre className="tstep-code-body hljs">
+        <code dangerouslySetInnerHTML={{ __html: renderHighlighted(detail) }} />
+      </pre>
+    </div>
+  );
+});
 
 // A real message: user / assistant / plan / ask get an avatar + bubble.
-function MessageRow({
+const MessageRow = memo(function MessageRow({
   msg,
   onRequestRevert,
   onApprovePlan,
@@ -1392,6 +2271,30 @@ function MessageRow({
   onEditPlan: () => void;
   onPreviewImage?: (src: string) => void;
 }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    const textToCopy = msg.text || "";
+    if (!textToCopy) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(textToCopy);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = textToCopy;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
   // The agent asked a question — render an inline card with the options.
   if (msg.role === "ask") {
     return (
@@ -1439,7 +2342,46 @@ function MessageRow({
     );
   }
 
+  const isError = msg.kind === "error" || msg.role === "error";
   const isUser = msg.role === "user";
+
+  if (isError) {
+    return (
+      <div className="msg assistant msg-error-row">
+        <div className="msg-avatar error-avatar">
+          <Icon name="close" size={15} />
+        </div>
+        <div className="msg-body">
+          <div className="bubble bubble-error">
+            <div className="error-bubble-header">
+              <div className="error-bubble-title-box">
+                <Icon name="close" size={14} />
+                <span className="error-bubble-title">Lỗi từ Agent / Quota</span>
+                {msg.ts ? (
+                  <span className="error-bubble-time" title={`Nhận lúc ${new Date(msg.ts).toLocaleString()}`}>
+                    {fmtMsgTime(msg.ts)}
+                  </span>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="msg-action-btn error-copy"
+                title="Sao chép thông báo lỗi"
+                onClick={handleCopy}
+              >
+                <Icon name={copied ? "check" : "file"} size={11} />
+                <span>{copied ? "Đã chép" : "Sao chép"}</span>
+              </button>
+            </div>
+            <div className="error-bubble-content">
+              <Markdown text={msg.text} onOpenFile={onOpenFile} onPreviewImage={onPreviewImage} />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`msg ${msg.role}`}>
       <div className="msg-avatar">
@@ -1471,42 +2413,77 @@ function MessageRow({
             <Markdown text={msg.text} onOpenFile={onOpenFile} onPreviewImage={onPreviewImage} />
           )}
         </div>
-        {!isUser && (msg.meta?.turnTokens != null || msg.meta?.tokens != null) && (
-          <div className="msg-meta-footer">
-            <span className="meta-item tokens" title="Tổng số token đã tiêu tốn cho lượt này">
-              <Icon name="zap" size={11} />
-              <span>
-                {((msg.meta?.turnTokens || msg.meta?.tokens || 0) as number) >= 1000
-                  ? `${(((msg.meta?.turnTokens || msg.meta?.tokens || 0) as number) / 1000).toFixed(1)}k tokens`
-                  : `${msg.meta?.turnTokens || msg.meta?.tokens} tokens`}
+
+        {isUser ? (
+          <div className="msg-actions user-actions">
+            {msg.ts ? (
+              <span className="msg-time user-time" title={`Đã gửi lúc ${new Date(msg.ts).toLocaleString()}`}>
+                {fmtMsgTime(msg.ts)}
               </span>
-            </span>
+            ) : null}
+            <button
+              type="button"
+              className="msg-action-btn"
+              title="Sao chép nội dung tin nhắn"
+              onClick={handleCopy}
+            >
+              <Icon name={copied ? "check" : "file"} size={11} />
+              <span>{copied ? "Đã chép" : "Sao chép"}</span>
+            </button>
+            {msg.stepIndex != null && (
+              <button
+                type="button"
+                className="msg-action-btn msg-revert"
+                title="Hoàn tác code về đúng thời điểm này"
+                onClick={() => onRequestRevert && onRequestRevert(msg.stepIndex!)}
+              >
+                <Icon name="revert" size={11} /> <span>Revert</span>
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="msg-meta-footer">
+            <button
+              type="button"
+              className="msg-action-btn assistant-copy"
+              title="Sao chép toàn bộ phản hồi"
+              onClick={handleCopy}
+            >
+              <Icon name={copied ? "check" : "file"} size={11} />
+              <span>{copied ? "Đã chép" : "Sao chép"}</span>
+            </button>
+            {msg.ts ? (
+              <span className="meta-item time-stamp" title={`Đã nhận lúc ${new Date(msg.ts).toLocaleString()}`}>
+                <Icon name="clock" size={11} />
+                <span>{fmtMsgTime(msg.ts)}</span>
+              </span>
+            ) : null}
+            {(msg.meta?.turnTokens != null || msg.meta?.tokens != null) && (
+              <span className="meta-item tokens" title="Tổng số token đã tiêu tốn cho lượt này">
+                <Icon name="zap" size={11} />
+                <span>
+                  {((msg.meta?.turnTokens || msg.meta?.tokens || 0) as number) >= 1000
+                    ? `${(((msg.meta?.turnTokens || msg.meta?.tokens || 0) as number) / 1000).toFixed(1)}k tokens`
+                    : `${msg.meta?.turnTokens || msg.meta?.tokens} tokens`}
+                </span>
+              </span>
+            )}
             {msg.meta?.turnDurationMs != null && (
               <span className="meta-item time" title="Tổng thời gian thực thi của lượt">
-                <Icon name="clock" size={11} />
                 <span>{fmtDuration(msg.meta.turnDurationMs as number)}</span>
               </span>
             )}
           </div>
         )}
-        {isUser && msg.stepIndex != null && (
-          <button
-            className="msg-revert"
-            title="Hoàn tác code về đúng thời điểm này"
-            onClick={() => onRequestRevert && onRequestRevert(msg.stepIndex!)}
-          >
-            <Icon name="revert" size={12} /> <span>Revert về đây</span>
-          </button>
-        )}
       </div>
     </div>
   );
-}
+});
 
 // Plan card: renders the implementation plan + centered Đồng ý / Từ chối / Sửa.
 // Once the plan is answered (agent recorded an approval), the buttons vanish.
 // Clicking approve/reject shows a spinner until the poll reflects the answer.
-function PlanCard({
+const PlanCard = memo(function PlanCard({
   msg,
   onApprovePlan,
   onOpenFile,
@@ -1531,7 +2508,7 @@ function PlanCard({
 
   const act = async (approved: boolean) => {
     setBusy(approved ? "approve" : "reject");
-    await onApprovePlan(artifactUri, approved);
+    await onApprovePlan(artifactUri || "implementation_plan.md", approved);
   };
 
   return (
@@ -1541,26 +2518,29 @@ function PlanCard({
       </div>
       <div className="msg-body">
         <div className="plan-tag">
-          <Icon name="check" size={12} /> <span>Kế hoạch triển khai</span>
+          <Icon name="sparkles" size={12} /> <span>Kế hoạch triển khai</span>
+          {msg.ts ? <span className="plan-time">{fmtMsgTime(msg.ts)}</span> : null}
         </div>
         <div className="bubble">
           <Markdown text={msg.text} onOpenFile={onOpenFile} onPreviewImage={onPreviewImage} />
         </div>
-        {!answered && artifactUri && (
+        {!answered && (
           <div className="plan-actions">
             <button
-              className="primary sm"
+              type="button"
+              className="primary sm plan-btn-proceed"
               disabled={busy != null}
               onClick={() => act(true)}
             >
               {busy === "approve" ? (
                 <Icon name="spinner" size={14} className="spin" />
               ) : (
-                <Icon name="check" size={14} />
+                <Icon name="play" size={14} />
               )}
-              <span>Đồng ý</span>
+              <span>Tiến hành (Proceed)</span>
             </button>
             <button
+              type="button"
               className="warn sm"
               disabled={busy != null}
               onClick={() => act(false)}
@@ -1572,20 +2552,25 @@ function PlanCard({
               )}
               <span>Từ chối</span>
             </button>
-            <button className="ghost sm" disabled={busy != null} onClick={onEditPlan}>
-              <Icon name="edit" size={14} /> <span>Sửa</span>
+            <button
+              type="button"
+              className="ghost sm"
+              disabled={busy != null}
+              onClick={onEditPlan}
+            >
+              <Icon name="edit" size={14} /> <span>Góp ý sửa</span>
             </button>
           </div>
         )}
       </div>
     </div>
   );
-}
+});
 
 // Inline ask-question card: shows each question's options as selectable chips
 // and a Submit / Skip pair. Single-select per question (matches the IDE). Once
 // answered it locks so the choice is visible but not re-submittable.
-function AskQuestion({
+const AskQuestion = memo(function AskQuestion({
   msg,
   onAnswer,
   onSkip,
@@ -1594,8 +2579,8 @@ function AskQuestion({
   onAnswer: (
     stepIndex: number,
     answers: { selectedOptionIds: string[]; freeText?: string }[]
-  ) => void | Promise<void>;
-  onSkip: (stepIndex: number) => void | Promise<void>;
+  ) => Promise<any> | void;
+  onSkip: (stepIndex: number) => Promise<any> | void;
 }) {
   const questions: any[] = Array.isArray(msg.meta?.questions)
     ? (msg.meta!.questions as any[])
@@ -1623,7 +2608,9 @@ function AskQuestion({
     setBusy(true);
     try {
       await onAnswer(stepIdx, answers);
-    } catch {
+    } catch (e) {
+      console.error("Failed to answer question:", e);
+    } finally {
       setBusy(false);
     }
   };
@@ -1632,15 +2619,16 @@ function AskQuestion({
     setBusy(true);
     try {
       await onSkip(stepIdx);
-    } catch {
+    } catch (e) {
+      console.error("Failed to skip question:", e);
+    } finally {
       setBusy(false);
     }
   };
 
-  const canSubmit =
-    !answered &&
-    !busy &&
-    questions.some((_, qi) => (picks[qi]?.length ?? 0) > 0 || freeText[qi]);
+  const canSubmit = questions.every(
+    (_, qi) => (picks[qi] && picks[qi].length > 0) || (freeText[qi] && freeText[qi].trim())
+  );
 
   return (
     <div className="msg assistant ask-msg">
@@ -1648,6 +2636,10 @@ function AskQuestion({
         <Icon name="bot" size={15} />
       </div>
       <div className="msg-body">
+        <div className="ask-tag">
+          <Icon name="message" size={12} /> <span>Câu hỏi từ AI</span>
+          {msg.ts ? <span className="ask-time">{fmtMsgTime(msg.ts)}</span> : null}
+        </div>
         <div className="ask-card">
           {questions.map((q, qi) => {
             const desc =
@@ -1676,22 +2668,24 @@ function AskQuestion({
                     <code>{desc}</code>
                   </div>
                 )}
-                <div className="ask-options-list">
-                  {options.map((o: any, idx: number) => {
-                    const optId = String(o.id ?? idx + 1);
-                    const optText = String(o.text ?? o);
-                    const sel =
-                      (picks[qi]?.includes(optId) ?? false) ||
-                      (answered && preSelected.includes(optId));
+                <div className="ask-options">
+                  {options.map((opt: any, oi: number) => {
+                    const optId = opt?.id || String(oi);
+                    const optLabel = typeof opt === "string" ? opt : opt?.label || opt?.text || optId;
+                    const isPicked =
+                      picks[qi]?.includes(optId) ||
+                      (!picks[qi] && preSelected.includes(optId));
+
                     return (
                       <button
                         key={optId}
-                        className={"ask-option-row" + (sel ? " sel" : "")}
-                        disabled={answered}
+                        type="button"
+                        className={"ask-chip" + (isPicked ? " selected" : "")}
+                        disabled={busy || answered}
                         onClick={() => toggle(qi, optId)}
                       >
-                        <span className="opt-num">{idx + 1}</span>
-                        <span className="opt-label">{optText}</span>
+                        <span className="ask-chip-dot" />
+                        <span>{optLabel}</span>
                       </button>
                     );
                   })}
@@ -1732,4 +2726,4 @@ function AskQuestion({
       </div>
     </div>
   );
-}
+});

@@ -13,6 +13,7 @@ interface Props {
   wsFolders: WsFolder[];
   windows?: IdeWindowInfo[];
   activeWindowId?: string | null;
+  currentWsPath?: string | null;
   activeId: string;
   activeWs: string | null;
   pendingChat?: boolean;
@@ -25,9 +26,9 @@ interface Props {
 }
 
 interface WsEntry {
-  key: string; // workspace URI (file://…) or "__none__"
+  key: string;
   name: string;
-  path: string | null; // absolute fs path if known (from root scan)
+  path: string | null;
   items: Trajectory[];
 }
 
@@ -86,11 +87,47 @@ function buildWorkspaces(
   });
 }
 
+function groupTrajectoriesByDate(items: Trajectory[]) {
+  const groups: { [key: string]: Trajectory[] } = {
+    "Hôm nay": [],
+    "Hôm qua": [],
+    "7 ngày trước": [],
+    "Cũ hơn": [],
+  };
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const yesterday = today - 86400000;
+  const lastWeek = today - 7 * 86400000;
+
+  for (const item of items) {
+    if (!item.updatedAt) {
+      groups["Cũ hơn"].push(item);
+      continue;
+    }
+    const itemDate = new Date(item.updatedAt).getTime();
+    if (isNaN(itemDate)) {
+      groups["Cũ hơn"].push(item);
+    } else if (itemDate >= today) {
+      groups["Hôm nay"].push(item);
+    } else if (itemDate >= yesterday) {
+      groups["Hôm qua"].push(item);
+    } else if (itemDate >= lastWeek) {
+      groups["7 ngày trước"].push(item);
+    } else {
+      groups["Cũ hơn"].push(item);
+    }
+  }
+
+  return Object.entries(groups).filter(([_, list]) => list.length > 0);
+}
+
 export function Sidebar({
   trajectories,
   wsFolders,
   windows = [],
   activeWindowId,
+  currentWsPath,
   activeId,
   activeWs,
   pendingChat,
@@ -101,6 +138,9 @@ export function Sidebar({
   onOpenWorkspace,
   onRefresh,
 }: Props) {
+  const [wsSearch, setWsSearch] = useState("");
+  const [chatSearch, setChatSearch] = useState("");
+
   const workspaces = useMemo(
     () => buildWorkspaces(wsFolders, trajectories),
     [wsFolders, trajectories]
@@ -113,6 +153,16 @@ export function Sidebar({
           (w.path && normalizeKey("file://" + w.path) === normActiveWs)
       )
     : null;
+
+  const isWorkspaceActive = (w: WsEntry) => {
+    if (!currentWsPath) return false;
+    const normCurrentPath = normalizeKey(currentWsPath);
+    return (
+      normalizeKey(w.key) === normalizeKey("file://" + currentWsPath) ||
+      (w.path && normalizeKey(w.path) === normCurrentPath)
+    );
+  };
+
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newWsName, setNewWsName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -132,24 +182,63 @@ export function Sidebar({
     }
   };
 
+  const filteredWorkspaces = useMemo(() => {
+    if (!wsSearch.trim()) return workspaces;
+    const q = wsSearch.toLowerCase();
+    return workspaces.filter(
+      (w) => w.name.toLowerCase().includes(q) || (w.path && w.path.toLowerCase().includes(q))
+    );
+  }, [workspaces, wsSearch]);
+
+  const filteredChats = useMemo(() => {
+    if (!current) return [];
+    if (!chatSearch.trim()) return current.items;
+    const q = chatSearch.toLowerCase();
+    return current.items.filter(
+      (t) =>
+        (t.title && t.title.toLowerCase().includes(q)) ||
+        t.id.toLowerCase().includes(q)
+    );
+  }, [current, chatSearch]);
+
+  const groupedChats = useMemo(
+    () => groupTrajectoriesByDate(filteredChats),
+    [filteredChats]
+  );
+
   // ---- Workspace list view ----
   if (!current) {
     return (
       <aside className="sidebar">
         <div className="side-actions">
           <div className="side-title">
-            <Icon name="folder" size={15} /> <span>Workspaces</span>
+            <Icon name="folder" size={16} /> <span>Workspaces</span>
           </div>
           <button
             className="ghost icon-btn"
             onClick={() => setShowCreateModal(true)}
             title="Tạo workspace mới"
           >
-            <Icon name="plus" size={16} />
+            <Icon name="plus" size={15} />
           </button>
           <button className="ghost icon-btn" onClick={() => onRefresh()} title="Làm mới">
-            <Icon name="refresh" size={16} />
+            <Icon name="refresh" size={15} />
           </button>
+        </div>
+
+        <div className="side-search-box">
+          <Icon name="search" size={13} className="side-search-icon" />
+          <input
+            type="text"
+            placeholder="Tìm kiếm workspace..."
+            value={wsSearch}
+            onChange={(e) => setWsSearch(e.target.value)}
+          />
+          {wsSearch && (
+            <button className="ghost icon-btn sm" onClick={() => setWsSearch("")}>
+              <Icon name="close" size={11} />
+            </button>
+          )}
         </div>
 
         <div className="side-body">
@@ -158,7 +247,7 @@ export function Sidebar({
             <div className="sidebar-windows-section">
               <div className="side-section-header">
                 <Icon name="server" size={13} />
-                <span>IDE đang mở ({windows.length})</span>
+                <span>Cửa sổ IDE đang mở ({windows.length})</span>
               </div>
               <ul className="ws-list live-win-list">
                 {windows.map((win) => {
@@ -195,26 +284,43 @@ export function Sidebar({
             </div>
           )}
 
-          {workspaces.length === 0 && (
+          {filteredWorkspaces.length === 0 && (
             <div className="side-empty">
-              Chưa có workspace. Đặt "Thư mục chứa workspace" trong Cài đặt.
+              {wsSearch ? "Không tìm thấy workspace nào phù hợp." : "Chưa có workspace. Đặt thư mục root trong Cài đặt."}
             </div>
           )}
+
           <ul className="ws-list">
-            {workspaces.map((w) => (
-              <li key={w.key}>
-                <button className="ws-pick" onClick={() => onSelectWs(w.key)}>
-                  <Icon name="folder" size={16} className="folder" />
-                  <span className="ws-name">{w.name}</span>
-                  {w.items.length > 0 && (
-                    <span className="ws-count">{w.items.length}</span>
-                  )}
-                  <Icon name="chevronRight" size={14} className="chev" />
-                </button>
-              </li>
-            ))}
+            {filteredWorkspaces.map((w) => {
+              const active = isWorkspaceActive(w);
+              return (
+                <li key={w.key}>
+                  <button
+                    className={`ws-pick ${active ? "ws-item-active" : ""}`}
+                    onClick={() => onSelectWs(w.key)}
+                    title={w.path || w.key}
+                  >
+                    <div className="ws-icon-wrap">
+                      <Icon name="folder" size={16} className={active ? "accent-color" : "folder"} />
+                    </div>
+                    <div className="ws-info">
+                      <span className="ws-name">{w.name}</span>
+                      {w.path && <span className="ws-path-hint">{w.path.split("/").slice(-2).join("/")}</span>}
+                    </div>
+                    {active && <span className="ws-active-badge">Đang mở</span>}
+                    {w.items.length > 0 && (
+                      <span className="ws-count" title={`${w.items.length} phiên trò chuyện`}>
+                        {w.items.length}
+                      </span>
+                    )}
+                    <Icon name="chevronRight" size={13} className="chev" />
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </div>
+
         {showCreateModal && createPortal(
           <div className="modal-overlay">
             <div className="modal-content">
@@ -222,7 +328,7 @@ export function Sidebar({
               <input
                 type="text"
                 autoFocus
-                placeholder="Nhập tên thư mục..."
+                placeholder="Nhập tên thư mục dự án..."
                 value={newWsName}
                 onChange={(e) => setNewWsName(e.target.value)}
                 onKeyDown={(e) => {
@@ -256,6 +362,8 @@ export function Sidebar({
   }
 
   // ---- Conversation list for the selected workspace ----
+  const currentIsActiveInIde = isWorkspaceActive(current);
+
   return (
     <aside className="sidebar">
       <div className="side-actions">
@@ -266,62 +374,101 @@ export function Sidebar({
         >
           <Icon name="chevronLeft" size={16} />
         </button>
-        <div className="side-title" title={current.key}>
+        <div className="side-title" title={current.path || current.key}>
           <span className="ws-name">{current.name}</span>
+          {currentIsActiveInIde && <span className="ws-active-badge-sm">Đang mở</span>}
         </div>
         <button className="ghost icon-btn" onClick={() => onRefresh()} title="Làm mới">
-          <Icon name="refresh" size={16} />
+          <Icon name="refresh" size={15} />
         </button>
       </div>
 
       <div className="side-actions no-top">
         <button
-          className="primary icon-btn full"
+          className="primary icon-btn full new-chat-btn"
           onClick={() => {
             if (current.path) onOpenWorkspace(current.path);
             onNewChat();
           }}
         >
-          <Icon name="plus" size={16} /> <span>Hội thoại mới</span>
+          <Icon name="plus" size={15} /> <span>Hội thoại mới</span>
         </button>
       </div>
 
-      <div className="side-body">
-        {current.items.length === 0 && !pendingChat && (
-          <div className="side-empty">Chưa có hội thoại. Tạo mới ở trên.</div>
+      <div className="side-search-box">
+        <Icon name="search" size={13} className="side-search-icon" />
+        <input
+          type="text"
+          placeholder="Tìm lịch sử chat..."
+          value={chatSearch}
+          onChange={(e) => setChatSearch(e.target.value)}
+        />
+        {chatSearch && (
+          <button className="ghost icon-btn sm" onClick={() => setChatSearch("")}>
+            <Icon name="close" size={11} />
+          </button>
         )}
-        <ul className="conv-list flush">
+      </div>
+
+      <div className="side-body">
+        {filteredChats.length === 0 && !pendingChat && (
+          <div className="side-empty">
+            {chatSearch ? "Không tìm thấy cuộc trò chuyện nào." : "Chưa có hội thoại nào trong workspace này."}
+          </div>
+        )}
+
+        <div className="conv-grouped-container">
           {pendingChat && (
-            <li className="conv-item active pending">
-              <span className="dot-status" />
-              <div className="conv-main">
-                <div className="conv-title">Hội thoại mới</div>
-                <div className="conv-sub">Chưa có tin nhắn</div>
-              </div>
-            </li>
-          )}
-          {current.items.map((t) => {
-            const running = String(t.status ?? "")
-              .toUpperCase()
-              .includes("RUNNING");
-            return (
-              <li
-                key={t.id}
-                className={"conv-item" + (t.id === activeId ? " active" : "")}
-                onClick={() => onSwitch(t.id, current.key, current.name)}
-                title={t.title || t.id}
-              >
-                <span className={"dot-status" + (running ? " run" : "")} />
-                <div className="conv-main">
-                  <div className="conv-title">
-                    {t.title || "Cuộc trò chuyện mới"}
+            <div className="conv-group">
+              <div className="conv-group-title">Đang tạo</div>
+              <ul className="conv-list flush">
+                <li className="conv-item active pending">
+                  <span className="dot-status run" />
+                  <div className="conv-main">
+                    <div className="conv-title">Hội thoại mới</div>
+                    <div className="conv-sub">Sẵn sàng nhận câu hỏi...</div>
                   </div>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
+                </li>
+              </ul>
+            </div>
+          )}
+
+          {groupedChats.map(([groupName, items]) => (
+            <div key={groupName} className="conv-group">
+              <div className="conv-group-title">{groupName}</div>
+              <ul className="conv-list flush">
+                {items.map((t) => {
+                  const running = String(t.status ?? "")
+                    .toUpperCase()
+                    .includes("RUNNING");
+                  const isCur = t.id === activeId;
+                  return (
+                    <li
+                      key={t.id}
+                      className={`conv-item ${isCur ? "active" : ""}`}
+                      onClick={() => onSwitch(t.id, current.key, current.name)}
+                      title={t.title || t.id}
+                    >
+                      <span className={`dot-status ${running ? "run" : ""}`} />
+                      <div className="conv-main">
+                        <div className="conv-title">
+                          {t.title || "Cuộc trò chuyện mới"}
+                        </div>
+                        {t.updatedAt && (
+                          <div className="conv-sub">
+                            {new Date(t.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </div>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </div>
       </div>
     </aside>
   );
 }
+

@@ -123,16 +123,15 @@ export class ChatController {
   // choice and mark it selected in the list + attempt it via CDP).
   private selectedModelId = "";
 
-  // Sticky selection: once the user picks a conversation or creates a new one,
-  // the poller must NOT auto-jump back to whatever cascade happens to be RUNNING
-  // (an older long-running chat). We only auto-resolve when nothing is chosen.
   private userSelected = false;
   private generatingTimeout: NodeJS.Timeout | null = null;
+  private sendingUntil = 0;
   // Pending "new chat": startNewConversation doesn't create a trajectory until
   // the first message is sent, so we show an empty transcript and suppress the
   // poller until a brand-new cascade id appears (or the user sends a message).
   private pendingNewChat = false;
   private knownIdsAtNewChat = new Set<string>();
+  private revertCheckpoints = new Map<string, number>();
 
   constructor(ls: LsClient, log: (m: string) => void = () => {}) {
     this.ls = ls;
@@ -319,10 +318,14 @@ export class ChatController {
     if (!text.trim() && (!images || images.length === 0)) return;
     // Any send counts as an explicit selection, so the poller stays put.
     this.userSelected = true;
+    this.sendingUntil = Date.now() + 6000;
+    this.lastGenerating = true;
+    this.lastStatusText = "Thinking";
     const isNew = this.pendingNewChat;
     const id = isNew ? "" : (this.activeCascadeId || (await this.resolveActiveCascadeId()));
+    if (id) this.revertCheckpoints.delete(id);
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M298";
 
     let sent = false;
 
@@ -364,9 +367,12 @@ export class ChatController {
       }
     }
 
-    // Try focusing/opening the agent panel in the IDE when chatting from web
+    // Try focusing/opening the agent panel and matching conversation in the IDE when chatting from web
     try {
       await vscode.commands.executeCommand("workbench.action.chat.open");
+      if (id) {
+        await this.switchCascade(id);
+      }
     } catch {}
 
     // Prefer direct LS SendUserCascadeMessage with the explicitly chosen model
@@ -420,10 +426,28 @@ export class ChatController {
       this.lastStepSig = "";
       this.lastGenerating = true;
       this.lastStatusText = "Thinking";
-      const id = this.activeCascadeId;
-      if (id) {
-        this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
+      // Poll briefly for Language Server to record the new USER_INPUT step into trajectory
+      for (let i = 0; i < 12; i++) {
+        await delay(100);
+        const data = id ? await this.ls.getTrajectory(id) : null;
+        const steps = extractSteps(data);
+        const hasNewUserStep = steps.some((s: any) => {
+          const type = shortType(s?.type);
+          if (type !== "USER_INPUT") return false;
+          const uText = String(
+            s.userInput?.userResponse ??
+              s.userInput?.items?.find((it: any) => it?.text)?.text ??
+              s.userInput?.items?.[0]?.text ??
+              ""
+          ).trim();
+          return uText === text.trim() || text.trim().includes(uText);
+        });
+        if (hasNewUserStep) {
+          this.sendingUntil = 0;
+          break;
+        }
       }
+      await this.pushFullState();
     }
   }
 
@@ -448,7 +472,7 @@ export class ChatController {
       return;
     }
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M16";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M298";
     const ok = await this.ls.sendCascadeItems(id, items, [], model);
     if (!ok) {
       await this.sendMessage(fallbackText);
@@ -460,7 +484,7 @@ export class ChatController {
       this.lastStepSig = "";
       this.lastGenerating = true;
       this.lastStatusText = "Thinking";
-      this.emit({ type: "status", cascadeId: id, generating: true, statusText: "Thinking" });
+      await this.pushFullState();
     }
   }
 
@@ -518,24 +542,32 @@ export class ChatController {
     // Explicit user choice: pin it and cancel any pending-new-chat state.
     this.userSelected = true;
     this.pendingNewChat = false;
-    try {
-      await vscode.commands.executeCommand(
-        "workbench.action.smartFocusConversation",
-        id
-      );
-    } catch {
-      try {
-        await vscode.commands.executeCommand(
-          "workbench.action.forceFocusManager",
-          id
-        );
-      } catch {
-        /* ignore */
-      }
-    }
     this.activeCascadeId = id;
     this.lastStepSig = "";
     this.lastCdpSig = "";
+
+    const candidates = [
+      "antigravity.openConversation",
+      "antigravity.focusConversation",
+      "antigravity.openCascade",
+      "antigravity.switchCascade",
+      "workbench.action.smartFocusConversation",
+      "workbench.action.forceFocusManager",
+      "windsurf.openCascade",
+    ];
+    for (const cmd of candidates) {
+      try {
+        await vscode.commands.executeCommand(cmd, id);
+        break;
+      } catch {}
+    }
+
+    if (this.cdpConnected()) {
+      try {
+        await this.cdp.openConversation(id);
+      } catch {}
+    }
+
     await this.pushFullState();
   }
 
@@ -565,10 +597,20 @@ export class ChatController {
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
     if (!id || stepIndex == null || stepIndex < 0) return false;
     await this.cancel();
-    await delay(150);
+    await delay(100);
     const model = this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
     const ok = await this.ls.revertToStep(id, stepIndex, model);
-    await delay(300);
+
+    // Save revert checkpoint so buildState truncates old messages immediately
+    this.revertCheckpoints.set(id, stepIndex);
+
+    if (this.cdpConnected()) {
+      try {
+        await this.cdp.revertToStep(stepIndex);
+      } catch {}
+    }
+
+    await delay(150);
     this.lastStepSig = "";
     await this.pushFullState();
     this.log(`[chat] revert to step ${stepIndex} -> ${ok ? "ok" : "failed"}`);
@@ -612,26 +654,72 @@ export class ChatController {
   }
 
   // Answer an ask_question interaction. `answers` maps question index → chosen
+  // Answer an ask_question interaction. `answers` maps question index → chosen
   // option ids (+ optional free text). We rebuild the full responses[] the LS
   // expects (echoing the questions/options) so the agent resumes.
   async answerQuestion(
     stepIndex: number,
     answers: { selectedOptionIds: string[]; freeText?: string }[]
   ): Promise<boolean> {
+    // 1. Try CDP direct interaction in the IDE window first
+    const optIndices: number[] = [];
+    let customText = "";
+    for (const a of answers) {
+      if (Array.isArray(a.selectedOptionIds)) {
+        for (const idStr of a.selectedOptionIds) {
+          const n = parseInt(idStr, 10);
+          if (!isNaN(n) && n > 0) optIndices.push(n - 1);
+        }
+      }
+      if (a.freeText) customText = a.freeText;
+    }
+    const cdpOk = await this.cdp.answerQuestion({
+      optionIndices: optIndices,
+      freeText: customText,
+    });
+
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
-    if (!id) return false;
+    if (!id) return cdpOk;
     const data = await this.ls.getTrajectory(id);
-    const trajectoryId = String(data?.trajectory?.trajectoryId ?? "");
     const steps = extractSteps(data) as any[];
 
-    let step = steps.find(
-      (s, idx) =>
+    // Find the active ask step (waiting for interaction)
+    let step = steps.slice().reverse().find(
+      (s) =>
         s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex ||
         s?.stepIndex === stepIndex ||
-        s?.step_index === stepIndex ||
-        idx === stepIndex
+        s?.step_index === stepIndex
     );
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) =>
+          (s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+            s?.type === "ASK_QUESTION" ||
+            s?.type === "ASK_PERMISSION" ||
+            Boolean(s?.askQuestion) ||
+            Boolean(s?.requestedInteraction?.askQuestion)) &&
+          s?.status !== "CORTEX_STEP_STATUS_DONE" &&
+          s?.status !== "CORTEX_STEP_STATUS_COMPLETED"
+      );
+    }
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) =>
+          s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+          s?.type === "ASK_QUESTION" ||
+          s?.type === "ASK_PERMISSION" ||
+          Boolean(s?.askQuestion) ||
+          Boolean(s?.requestedInteraction?.askQuestion)
+      );
+    }
     if (!step && steps.length > 0) step = steps[steps.length - 1];
+
+    const trajectoryId = String(
+      step?.metadata?.sourceTrajectoryStepInfo?.trajectoryId ||
+      data?.trajectory?.trajectoryId ||
+      data?.trajectory?.metadata?.trajectoryId ||
+      id
+    );
 
     const realStepIndex =
       step?.metadata?.sourceTrajectoryStepInfo?.stepIndex ??
@@ -639,56 +727,182 @@ export class ChatController {
       step?.step_index ??
       stepIndex;
 
-    const aq = step?.askQuestion ?? step?.requestedInteraction?.askQuestion ?? step?.askPermission;
-    const questions: any[] = Array.isArray(aq?.questions) ? aq.questions : [];
+    const aq =
+      step?.askQuestion ??
+      step?.requestedInteraction?.askQuestion ??
+      step?.askPermission;
+    const rawQList = parseAskQuestions(step);
+    const questions: any[] = Array.isArray(aq?.questions) && aq.questions.length > 0
+      ? aq.questions
+      : rawQList;
 
-    const responses = (questions.length > 0 ? questions : answers).map((q, i) => {
-      const a = answers[i] ?? { selectedOptionIds: [] };
-      const r: any = {
-        question: typeof q === "string" ? q : (q?.question ?? ""),
-        options: q?.options ?? [],
-      };
-      if (Array.isArray(a.selectedOptionIds) && a.selectedOptionIds.length > 0) {
-        r.selectedOptionIds = a.selectedOptionIds;
+    const responses = (questions.length > 0 ? questions : answers).map(
+      (q, i) => {
+        const a = answers[i] ?? { selectedOptionIds: [] };
+        const rawOpts = q?.options ?? [];
+        const opts = Array.isArray(rawOpts)
+          ? rawOpts.map((o: any, idx: number) => ({
+              id: String(o.id ?? idx + 1),
+              text: String(o.text ?? o),
+            }))
+          : [];
+        const r: any = {
+          question: typeof q === "string" ? q : q?.question ?? "",
+          options: opts,
+        };
+        if (
+          Array.isArray(a.selectedOptionIds) &&
+          a.selectedOptionIds.length > 0
+        ) {
+          r.selectedOptionIds = a.selectedOptionIds.map(String);
+        }
+        if (a.freeText) {
+          r.writeInResponse = a.freeText;
+        }
+        return r;
       }
-      if (a.freeText) {
-        r.writeInResponse = a.freeText;
-      }
-      return r;
-    });
+    );
 
-    const ok = await this.ls.handleUserInteraction(id, trajectoryId, realStepIndex, responses);
+    const ok = await this.ls.handleUserInteraction(
+      id,
+      trajectoryId,
+      realStepIndex,
+      responses
+    );
 
     this.lastStepSig = "";
     await this.pushFullState();
-    this.log(`[chat] answer question step ${stepIndex} (real: ${realStepIndex}) -> ${ok ? "ok" : "failed"}`);
-    return ok;
+    this.log(
+      `[chat] answer question step ${stepIndex} (real: ${realStepIndex}) -> rpc: ${ok ? "ok" : "failed"}, cdp: ${cdpOk ? "ok" : "failed"}`
+    );
+
+    if (!ok && !cdpOk) {
+      // Fallback: send response as message to unblock the agent
+      const choiceTexts: string[] = [];
+      for (let i = 0; i < answers.length; i++) {
+        const a = answers[i];
+        if (a.freeText) {
+          choiceTexts.push(a.freeText);
+        } else if (Array.isArray(a.selectedOptionIds) && a.selectedOptionIds.length > 0) {
+          const q = questions[i];
+          const optTexts = a.selectedOptionIds.map((optId) => {
+            const idx = parseInt(optId, 10) - 1;
+            if (q && Array.isArray(q.options) && q.options[idx]) {
+              const o = q.options[idx];
+              return typeof o === "string" ? o : o.text || optId;
+            }
+            return `Lựa chọn ${optId}`;
+          });
+          choiceTexts.push(optTexts.join(", "));
+        }
+      }
+      if (choiceTexts.length > 0) {
+        await this.sendMessage(choiceTexts.join("; "));
+        return true;
+      }
+    }
+
+    return ok || cdpOk;
   }
 
   // Skip an ask_question interaction (equivalent to the IDE's "skip" — send
   // empty selections so the agent proceeds with its recommendation).
   async skipQuestion(stepIndex: number): Promise<boolean> {
+    // 1. Try CDP direct skip in the IDE window
+    const cdpOk = await this.cdp.answerQuestion({ isSkip: true });
+
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
-    if (!id) return false;
+    if (!id) return cdpOk;
     const data = await this.ls.getTrajectory(id);
-    const trajectoryId = String(data?.trajectory?.trajectoryId ?? "");
-    if (!trajectoryId) return false;
     const steps = extractSteps(data) as any[];
-    const step = steps.find(
-      (s) => s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex
+
+    // Find the active ask step (waiting for interaction)
+    let step = steps.slice().reverse().find(
+      (s) =>
+        s?.metadata?.sourceTrajectoryStepInfo?.stepIndex === stepIndex ||
+        s?.stepIndex === stepIndex ||
+        s?.step_index === stepIndex
     );
-    const aq = step?.askQuestion ?? step?.requestedInteraction?.askQuestion;
-    const questions: any[] = Array.isArray(aq?.questions) ? aq.questions : [];
-    const responses = questions.map((q) => ({
-      question: q?.question ?? "",
-      options: q?.options ?? [],
-      selectedOptionIds: [],
-      skipped: true,
-    }));
-    const ok = await this.ls.handleUserInteraction(id, trajectoryId, stepIndex, responses);
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) =>
+          (s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+            s?.type === "ASK_QUESTION" ||
+            s?.type === "ASK_PERMISSION" ||
+            Boolean(s?.askQuestion) ||
+            Boolean(s?.requestedInteraction?.askQuestion)) &&
+          s?.status !== "CORTEX_STEP_STATUS_DONE" &&
+          s?.status !== "CORTEX_STEP_STATUS_COMPLETED"
+      );
+    }
+    if (!step) {
+      step = steps.slice().reverse().find(
+        (s) =>
+          s?.type === "CORTEX_STEP_TYPE_ASK_QUESTION" ||
+          s?.type === "ASK_QUESTION" ||
+          s?.type === "ASK_PERMISSION" ||
+          Boolean(s?.askQuestion) ||
+          Boolean(s?.requestedInteraction?.askQuestion)
+      );
+    }
+    if (!step && steps.length > 0) step = steps[steps.length - 1];
+
+    const trajectoryId = String(
+      step?.metadata?.sourceTrajectoryStepInfo?.trajectoryId ||
+      data?.trajectory?.trajectoryId ||
+      data?.trajectory?.metadata?.trajectoryId ||
+      id
+    );
+
+    const realStepIndex =
+      step?.metadata?.sourceTrajectoryStepInfo?.stepIndex ??
+      step?.stepIndex ??
+      step?.step_index ??
+      stepIndex;
+
+    const aq =
+      step?.askQuestion ??
+      step?.requestedInteraction?.askQuestion ??
+      step?.askPermission;
+    const rawQList = parseAskQuestions(step);
+    const questions: any[] = Array.isArray(aq?.questions) && aq.questions.length > 0
+      ? aq.questions
+      : rawQList;
+
+    const responses = (questions.length > 0 ? questions : [{}]).map((q) => {
+      const rawOpts = q?.options ?? [];
+      const opts = Array.isArray(rawOpts)
+        ? rawOpts.map((o: any, idx: number) => ({
+            id: String(o.id ?? idx + 1),
+            text: String(o.text ?? o),
+          }))
+        : [];
+      return {
+        question: typeof q === "string" ? q : q?.question ?? "",
+        options: opts,
+        selectedOptionIds: [],
+        skipped: true,
+      };
+    });
+
+    const ok = await this.ls.handleUserInteraction(
+      id,
+      trajectoryId,
+      realStepIndex,
+      responses
+    );
     this.lastStepSig = "";
     await this.pushFullState();
-    return ok;
+    this.log(
+      `[chat] skip question step ${stepIndex} (real: ${realStepIndex}) -> rpc: ${ok ? "ok" : "failed"}, cdp: ${cdpOk ? "ok" : "failed"}`
+    );
+
+    if (!ok && !cdpOk) {
+      await this.sendMessage("User Skipped");
+      return true;
+    }
+
+    return ok || cdpOk;
   }
 
   // Fetch the dynamic slash-command catalog for the active cascade.
@@ -703,7 +917,7 @@ export class ChatController {
       ).filter(Boolean) ??
       [];
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M298";
     return this.ls.getSlashCommands(id, uris, model);
   }
 
@@ -716,7 +930,7 @@ export class ChatController {
     const id = this.activeCascadeId || (await this.resolveActiveCascadeId());
     if (!id) return false;
     const model =
-      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M36";
+      this.selectedModelId || (await this.detectActiveModel()) || "MODEL_PLACEHOLDER_M298";
     const ok = await this.ls.approveArtifact(id, artifactUri, approved, model);
     this.lastStepSig = "";
     await this.pushFullState();
@@ -789,20 +1003,40 @@ export class ChatController {
         const mid = String(c?.modelOrAlias?.model ?? "");
         const alias = String(c?.modelOrAlias?.alias ?? "");
         const label = String(c?.label ?? "");
-        return this.selectedModelId && (this.selectedModelId === mid || this.selectedModelId === alias || this.selectedModelId === label);
+        return (
+          this.selectedModelId &&
+          (this.selectedModelId === mid ||
+            this.selectedModelId === alias ||
+            this.selectedModelId === label)
+        );
       });
 
       if (!this.selectedModelId || !hasSelected) {
-        // Default to Gemini 3.7 Flash High (M36)
-        const m36 = configs.find((c: any) => {
-          const mid = String(c?.modelOrAlias?.model ?? "");
-          const label = String(c?.label ?? "").toLowerCase();
-          return mid === "MODEL_PLACEHOLDER_M36" || (label.includes("3.7") && label.includes("flash"));
-        });
-        if (m36) {
-          this.selectedModelId = String(m36?.modelOrAlias?.model ?? m36?.modelOrAlias?.alias ?? m36?.label ?? "MODEL_PLACEHOLDER_M36");
-        } else {
-          this.selectedModelId = "MODEL_PLACEHOLDER_M36";
+        if (activeModel) {
+          const matched = configs.find((c: any) => {
+            const mid = String(c?.modelOrAlias?.model ?? "");
+            const alias = String(c?.modelOrAlias?.alias ?? "");
+            const label = String(c?.label ?? "");
+            return activeModel === mid || activeModel === alias || activeModel === label;
+          });
+          if (matched) {
+            this.selectedModelId = String(
+              matched?.modelOrAlias?.model ??
+                matched?.modelOrAlias?.alias ??
+                matched?.label ??
+                ""
+            );
+          }
+        }
+        if (!this.selectedModelId) {
+          // Default to recommended or first config
+          const recModel = configs.find((c: any) => c?.isRecommended) || configs[0];
+          this.selectedModelId = String(
+            recModel?.modelOrAlias?.model ??
+              recModel?.modelOrAlias?.alias ??
+              recModel?.label ??
+              ""
+          );
         }
       }
 
@@ -817,8 +1051,11 @@ export class ChatController {
             this.selectedModelId === alias ||
             this.selectedModelId === label
           : activeModel
-          ? activeModel === mid || activeModel === alias || activeModel === label || activeModel === id
-          : mid === "MODEL_PLACEHOLDER_M36" || Boolean(c?.isRecommended);
+          ? activeModel === mid ||
+            activeModel === alias ||
+            activeModel === label ||
+            activeModel === id
+          : Boolean(c?.isRecommended);
         return {
           id,
           label: label || mid || alias,
@@ -919,9 +1156,30 @@ export class ChatController {
       this.pendingNewChat = false;
       this.activeCascadeId = cascadeId;
     }
+    if (this.pendingNewChat && !cascadeId) {
+      return { cascadeId: "", generating: false, statusText: "Idle", messages: [] };
+    }
     const id = cascadeId || this.activeCascadeId || (await this.resolveActiveCascadeId());
     const data = id ? await this.ls.getTrajectory(id) : null;
-    const steps = extractSteps(data);
+    let steps = extractSteps(data);
+
+    // If an explicit revert checkpoint is active for this cascade, truncate steps to <= stepIndex
+    const revertTarget = id ? this.revertCheckpoints.get(id) : undefined;
+    if (typeof revertTarget === "number") {
+      const trimmed: TrajectoryStep[] = [];
+      for (const s of steps as any[]) {
+        const sIdx =
+          s.stepIndex ??
+          s.step_index ??
+          s.metadata?.sourceTrajectoryStepInfo?.stepIndex;
+        if (typeof sIdx === "number" && sIdx > revertTarget) {
+          break;
+        }
+        trimmed.push(s);
+      }
+      steps = trimmed;
+    }
+
     const trajectoryStatus = data?.trajectory?.status ?? data?.status;
     const generating = isGenerating(steps, trajectoryStatus);
     const statusText = describeStatus(steps, generating);
@@ -1014,7 +1272,13 @@ export class ChatController {
 
     // Debounce generating = false to prevent Stop button flickering between rapid step transitions
     let effectiveGenerating = generating;
-    if (generating) {
+    if (this.sendingUntil && Date.now() < this.sendingUntil) {
+      if (!generating) {
+        effectiveGenerating = true;
+      } else {
+        this.sendingUntil = 0;
+      }
+    } else if (generating) {
       if (this.generatingTimeout) {
         clearTimeout(this.generatingTimeout);
         this.generatingTimeout = null;
@@ -1140,6 +1404,33 @@ function stepDurationMs(step: any): number | null {
   return ms > 0 ? ms : null;
 }
 
+// Extract timestamp in ms from step metadata or timestamps.
+function stepTimestamp(step: any): number | undefined {
+  const m = step?.metadata;
+  const raw =
+    m?.completedAt ||
+    m?.startedAt ||
+    m?.createdAt ||
+    m?.timestamp ||
+    step?.completedAt ||
+    step?.startedAt ||
+    step?.createdAt ||
+    step?.timestamp;
+  if (!raw) return undefined;
+  if (typeof raw === "number") {
+    return raw < 1e11 ? raw * 1000 : raw;
+  }
+  if (typeof raw === "string") {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > 0) {
+      return num < 1e11 ? num * 1000 : num;
+    }
+  }
+  return undefined;
+}
+
 // Count inserted / deleted lines from a CODE_ACTION edit's unified diff.
 function diffStats(step: any): { added: number; removed: number } | null {
   const lines =
@@ -1180,6 +1471,17 @@ function toolInfo(step: any): { kind: string; verb: string; detail: string } {
       return { kind: "edit", verb: "Edited", detail: baseName(args.AbsolutePath || args.TargetFile || args?.ArtifactMetadata?.Summary || "") };
     case "MANAGE_TASK":
       return { kind: "task", verb: "Task", detail: String(args.toolSummary || "").slice(0, 60) };
+    case "BROWSER_SUBAGENT":
+    case "BROWSER":
+    case "OPEN_BROWSER_URL":
+    case "READ_BROWSER_PAGE":
+      return { kind: "browser", verb: "Browser", detail: String(args.TaskName || args.TaskSummary || args.Url || args.toolSummary || "").slice(0, 70) };
+    case "SEARCH_WEB":
+      return { kind: "search", verb: "Search Web", detail: String(args.query || args.Query || "").slice(0, 60) };
+    case "READ_URL_CONTENT":
+      return { kind: "read", verb: "Read URL", detail: String(args.Url || args.url || "").slice(0, 70) };
+    case "GENERATE_IMAGE":
+      return { kind: "edit", verb: "Generate Image", detail: String(args.Prompt || args.ImageName || "").slice(0, 60) };
     default: {
       const summary = args.toolSummary || args.toolAction || "";
       return { kind: "tool", verb: summary ? String(summary) : titleCase(type), detail: "" };
@@ -1203,12 +1505,47 @@ function describeStatus(steps: TrajectoryStep[], generating?: boolean): string {
   return info.detail ? `${info.verb} ${info.detail}` : info.verb;
 }
 
-// Is this CODE_ACTION step an implementation plan awaiting user approval?
+// Is this step an implementation plan awaiting user approval?
 function isPlanStep(step: any): boolean {
   const args = toolArgs(step);
+  const targetFile = String(
+    args.TargetFile ||
+      args.AbsolutePath ||
+      step?.codeAction?.actionSpec?.createFile?.path?.absoluteUri ||
+      ""
+  );
+  const base = baseName(targetFile).toLowerCase();
+
+  // Explicitly ignore walkthroughs, tasks, scratch files, and source code
+  if (
+    !base ||
+    base.includes("walkthrough") ||
+    base.includes("task") ||
+    base.includes("scratch") ||
+    base.endsWith(".ts") ||
+    base.endsWith(".tsx") ||
+    base.endsWith(".js") ||
+    base.endsWith(".jsx") ||
+    base.endsWith(".css") ||
+    base.endsWith(".html") ||
+    base.endsWith(".json")
+  ) {
+    return false;
+  }
+
+  // Must strictly be implementation_plan.md or plan.md
+  const isStrictPlanFile =
+    base === "implementation_plan.md" ||
+    base === "implementation_plan" ||
+    base === "plan.md" ||
+    targetFile.toLowerCase().endsWith("/implementation_plan.md") ||
+    targetFile.toLowerCase().endsWith("/plan.md");
+
+  if (!isStrictPlanFile) return false;
+
   const meta = args?.ArtifactMetadata;
-  return Boolean(meta && (meta.RequestFeedback || meta.UserFacing) &&
-    /plan/i.test(String(meta.Summary || "")));
+  // It must explicitly request feedback from the user
+  return meta?.RequestFeedback === true || meta?.RequestFeedback === "true";
 }
 
 // Extract the output / stdout / error result or detailed execution args of a step.
@@ -1216,8 +1553,11 @@ function stepDetailText(step: any): string | undefined {
   const type = shortType(step?.type ?? "");
   const args = toolArgs(step);
   let rawContent = typeof step?.content === "string" ? step.content.trim() : "";
-  if (rawContent.length > 25000) {
-    rawContent = rawContent.slice(0, 10000) + "\n\n...[TRUNCATED_BY_ANTIGRAVITY_REMOTE]...\n\n" + rawContent.slice(-10000);
+  if (rawContent.length > 35000) {
+    rawContent =
+      rawContent.slice(0, 15000) +
+      "\n\n...[TRUNCATED_BY_ANTIGRAVITY_REMOTE]...\n\n" +
+      rawContent.slice(-15000);
   }
 
   if (type === "RUN_COMMAND") {
@@ -1229,17 +1569,35 @@ function stepDetailText(step: any): string | undefined {
     return text || undefined;
   }
 
-  if (type === "CODE_ACTION" || type === "REPLACE_FILE_CONTENT" || type === "MULTI_REPLACE_FILE_CONTENT") {
+  if (type === "WRITE_TO_FILE") {
+    const file = args.TargetFile || args.AbsolutePath || "";
+    const desc = args.Description || "";
+    const code = args.CodeContent || "";
+    let text = file ? `Target: ${file}` : "";
+    if (desc) text += (text ? `\nDescription: ` : "") + desc;
+    if (code) text += (text ? `\n\n` : "") + code;
+    if (rawContent) text += (text ? `\n\n` : "") + rawContent;
+    return text || undefined;
+  }
+
+  if (
+    type === "CODE_ACTION" ||
+    type === "REPLACE_FILE_CONTENT" ||
+    type === "MULTI_REPLACE_FILE_CONTENT"
+  ) {
+    const file = args.TargetFile || args.AbsolutePath || "";
     const desc = args.Description || args.Instruction || "";
     let target = args.TargetContent || "";
     let replacement = args.ReplacementContent || "";
-    if (target.length > 5000) target = target.slice(0, 5000) + "\n...[TRUNCATED]";
-    if (replacement.length > 5000) replacement = replacement.slice(0, 5000) + "\n...[TRUNCATED]";
-    
-    let text = desc ? `Description: ${desc}` : "";
+    if (target.length > 8000) target = target.slice(0, 8000) + "\n...[TRUNCATED]";
+    if (replacement.length > 8000)
+      replacement = replacement.slice(0, 8000) + "\n...[TRUNCATED]";
+
+    let text = file ? `File: ${file}\n` : "";
+    if (desc) text += `Description: ${desc}\n`;
     if (target || replacement) {
-      if (text) text += "\n\n";
-      if (target) text += `--- Target:\n${target}\n`;
+      if (text) text += "\n";
+      if (target) text += `--- Target:\n${target}\n\n`;
       if (replacement) text += `+++ Replacement:\n${replacement}`;
     }
     if (rawContent) {
@@ -1260,13 +1618,43 @@ function stepDetailText(step: any): string | undefined {
     const file = args.AbsolutePath || args.Path || "";
     const start = args.StartLine;
     const end = args.EndLine;
-    let text = `File: ${file}` + (start != null ? ` (lines ${start}-${end})` : "");
+    let text =
+      `File: ${file}` + (start != null ? ` (lines ${start}-${end})` : "");
     if (rawContent) text += `\n\n${rawContent}`;
     return text;
   }
 
+  if (type === "LIST_DIRECTORY") {
+    const dir = args.DirectoryPath || args.Path || "";
+    let text = `Directory: ${dir}`;
+    if (rawContent) text += `\n\n${rawContent}`;
+    return text;
+  }
+
+  if (
+    type === "BROWSER_SUBAGENT" ||
+    type === "BROWSER" ||
+    type === "OPEN_BROWSER_URL" ||
+    type === "READ_BROWSER_PAGE"
+  ) {
+    const taskName = args.TaskName || "";
+    const task = args.Task || "";
+    const taskSummary = args.TaskSummary || "";
+    const url = args.Url || args.url || "";
+    let text = taskName ? `Task: ${taskName}\n` : "";
+    if (taskSummary) text += `Summary: ${taskSummary}\n`;
+    if (url) text += `URL: ${url}\n`;
+    if (task) text += `\nInstructions:\n${task}\n`;
+    if (rawContent) text += (text ? `\n\nResult:\n` : "") + rawContent;
+    return text || undefined;
+  }
+
   if (rawContent) return rawContent;
-  const desc = args.Description || args.Instruction || args.toolSummary || args.toolAction;
+  const desc =
+    args.Description ||
+    args.Instruction ||
+    args.toolSummary ||
+    args.toolAction;
   if (desc) return String(desc);
   if (Object.keys(args).length > 0) {
     return JSON.stringify(args, null, 2);
@@ -1298,12 +1686,366 @@ function stepTokenCount(step: any): number {
   return 18 + ((typeLen * 9) % 27);
 }
 
+function parseAskQuestions(step: any, tc?: any): any[] {
+  let rawArgs: any = {};
+  if (tc) {
+    if (typeof tc.argumentsJson === "string") {
+      try {
+        rawArgs = JSON.parse(tc.argumentsJson);
+      } catch {
+        rawArgs = {};
+      }
+    } else {
+      rawArgs = tc.args || {};
+    }
+  } else {
+    rawArgs = toolArgs(step);
+  }
+
+  const ri =
+    step?.requestedInteraction ||
+    step?.permissionRequest ||
+    step?.requestedPermission ||
+    step?.toolPermissionRequest ||
+    {};
+  const aq =
+    step?.askQuestion ||
+    ri?.askQuestion ||
+    step?.askPermission ||
+    ri?.askPermission ||
+    step?.permissionRequest ||
+    step?.requestedPermission ||
+    step?.toolPermissionRequest ||
+    ri?.toolPermissionRequest ||
+    ri?.permissionRequest ||
+    ri ||
+    {};
+
+  // 1. Array of questions in rawArgs.questions or aq.questions
+  let rawQList =
+    rawArgs.questions ||
+    aq.questions ||
+    ri.questions ||
+    step?.questions;
+
+  if (typeof rawQList === "string") {
+    try {
+      rawQList = JSON.parse(rawQList);
+    } catch {}
+  }
+
+  if (Array.isArray(rawQList) && rawQList.length > 0) {
+    return rawQList.map((q: any, qIdx: number) => {
+      if (typeof q === "string") {
+        return {
+          question: q,
+          description: "",
+          options: [
+            { id: "1", text: "Yes" },
+            { id: "2", text: "No" },
+          ],
+        };
+      }
+      const qText = String(
+        q.question || q.title || q.Reason || q.reason || `Câu hỏi ${qIdx + 1}`
+      ).trim();
+      const desc =
+        q.description ||
+        q.toolAction ||
+        q.toolSummary ||
+        q.targetPath ||
+        q.path ||
+        "";
+      let opts = q.options;
+      if (typeof opts === "string") {
+        try {
+          opts = JSON.parse(opts);
+        } catch {}
+      }
+      const parsedOptions = Array.isArray(opts)
+        ? opts.map((o: any, idx: number) =>
+            typeof o === "string"
+              ? { id: String(idx + 1), text: o }
+              : { id: String(o.id ?? idx + 1), text: String(o.text ?? o) }
+          )
+        : [
+            { id: "1", text: "Yes, allow this time" },
+            { id: "2", text: "Yes, and always allow" },
+            { id: "3", text: "No (tell the agent what to do instead)" },
+          ];
+      return {
+        question: qText,
+        description: desc,
+        options: parsedOptions,
+        is_multi_select: Boolean(q.is_multi_select || q.isMultiSelect),
+      };
+    });
+  }
+
+  // 2. Single question
+  const singleQ =
+    rawArgs.question ||
+    aq.question ||
+    aq.title ||
+    rawArgs.Reason ||
+    aq.reason;
+
+  if (singleQ) {
+    let opts = rawArgs.options || aq.options;
+    if (typeof opts === "string") {
+      try {
+        opts = JSON.parse(opts);
+      } catch {}
+    }
+    const parsedOptions = Array.isArray(opts)
+      ? opts.map((o: any, idx: number) =>
+          typeof o === "string"
+            ? { id: String(idx + 1), text: o }
+            : { id: String(o.id ?? idx + 1), text: String(o.text ?? o) }
+        )
+      : [
+          { id: "1", text: "Yes, allow this time" },
+          { id: "2", text: "Yes, and always allow" },
+          { id: "3", text: "No (tell the agent what to do instead)" },
+        ];
+    return [
+      {
+        question: String(singleQ),
+        description:
+          rawArgs.description ||
+          rawArgs.toolAction ||
+          rawArgs.toolSummary ||
+          rawArgs.targetPath ||
+          "",
+        options: parsedOptions,
+        is_multi_select: Boolean(rawArgs.is_multi_select || rawArgs.isMultiSelect),
+      },
+    ];
+  }
+
+  // 3. Permission request fallback
+  let targetPath = "";
+  const scanObj = (o: any, depth = 0) => {
+    if (!o || typeof o !== "object" || depth > 5) return;
+    if (!targetPath) {
+      const found =
+        o.targetPath ||
+        o.target ||
+        o.path ||
+        o.resource ||
+        o.file ||
+        o.filePath ||
+        o.Target ||
+        o.TargetFile ||
+        o.Path ||
+        o.Resource ||
+        o.uri ||
+        "";
+      if (found && typeof found === "string" && found.length > 1) {
+        targetPath = found;
+        return;
+      }
+    }
+    for (const k of Object.keys(o)) {
+      if (
+        o[k] &&
+        typeof o[k] === "object" &&
+        k !== "options" &&
+        k !== "questions" &&
+        k !== "plannerResponse"
+      ) {
+        scanObj(o[k], depth + 1);
+        if (targetPath) return;
+      }
+    }
+  };
+  scanObj(step);
+  if (!targetPath && tc) scanObj(rawArgs);
+
+  const actionType =
+    rawArgs.Action ||
+    rawArgs.action ||
+    ri.permissionType ||
+    ri.action ||
+    aq.action ||
+    aq.permissionType ||
+    "read access";
+  const reasonText = targetPath
+    ? `Cấp quyền truy cập cho tệp tin / thư mục:`
+    : `Allow ${actionType} to this path?`;
+
+  return [
+    {
+      question: reasonText,
+      description: targetPath,
+      options: [
+        { id: "1", text: "Yes, allow this time" },
+        { id: "2", text: "Yes, and always allow" },
+        { id: "3", text: "No (tell the agent what to do instead)" },
+      ],
+    },
+  ];
+}
+
+function isErrorLikeJson(text: string): boolean {
+  if (!text) return false;
+  const t = text.trim();
+  if (t.startsWith("{") && t.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(t);
+      if (
+        parsed.error ||
+        parsed.errorMessage ||
+        parsed.userErrorMessage ||
+        parsed.user_error_message ||
+        parsed.code === 429 ||
+        parsed.status === "RESOURCE_EXHAUSTED" ||
+        parsed.status === "ERROR"
+      ) {
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+function extractErrorString(step: any): string {
+  if (!step) return "Đã xảy ra lỗi khi thực thi.";
+
+  let errId =
+    step.errorId ||
+    step.error_id ||
+    step.error?.errorId ||
+    step.error?.error_id ||
+    step.error?.id ||
+    step.id ||
+    "";
+
+  const queue = [
+    step.error?.userErrorMessage,
+    step.error?.user_error_message,
+    step.userErrorMessage,
+    step.user_error_message,
+    step.errorMessage,
+    step.error_message,
+    step.error?.message,
+    step.error?.description,
+    step.error?.error?.message,
+    step.error?.error?.userErrorMessage,
+    step.error?.details,
+    step.systemMessage?.message,
+    step.systemMessage?.renderInfo?.description,
+    step.systemMessage?.renderInfo?.title,
+    step.failureReason,
+    step.error,
+    step.content,
+  ];
+
+  let rawMessage = "";
+
+  for (const item of queue) {
+    if (!item) continue;
+    if (typeof item === "string" && item.trim()) {
+      const s = item.trim();
+      if (s.startsWith("{") && s.endsWith("}")) {
+        try {
+          const parsed = JSON.parse(s);
+          const msg =
+            parsed.userErrorMessage ||
+            parsed.user_error_message ||
+            parsed.error?.userErrorMessage ||
+            parsed.error?.message ||
+            parsed.message ||
+            parsed.description;
+          if (msg) {
+            rawMessage = String(msg).trim();
+            if (parsed.errorId || parsed.id || parsed.error?.id) {
+              errId = parsed.errorId || parsed.id || parsed.error?.id;
+            }
+            break;
+          }
+        } catch {}
+      }
+      rawMessage = s;
+      break;
+    }
+    if (typeof item === "object") {
+      const msg =
+        item.userErrorMessage ||
+        item.user_error_message ||
+        item.error?.userErrorMessage ||
+        item.error?.message ||
+        item.message ||
+        item.description ||
+        item.title;
+      if (typeof msg === "string" && msg.trim()) {
+        rawMessage = msg.trim();
+        if (item.errorId || item.id || item.error_id || item.error?.id) {
+          errId = item.errorId || item.id || item.error_id || item.error?.id;
+        }
+        break;
+      }
+    }
+  }
+
+  if (!rawMessage || rawMessage === "[object Object]") {
+    rawMessage = "Đã xảy ra lỗi khi thực thi tác vụ.";
+  }
+
+  // If rawMessage is still a JSON string, try parsing it
+  if (rawMessage.startsWith("{") && rawMessage.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(rawMessage);
+      const msg =
+        parsed.userErrorMessage ||
+        parsed.user_error_message ||
+        parsed.error?.userErrorMessage ||
+        parsed.error?.message ||
+        parsed.message ||
+        parsed.description;
+      if (msg) rawMessage = String(msg).trim();
+      if (parsed.errorId || parsed.id || parsed.error?.id) {
+        errId = parsed.errorId || parsed.id || parsed.error?.id;
+      }
+    } catch {}
+  }
+
+  // Remove redundant Error: prefix
+  rawMessage = rawMessage.replace(/^Error:\s*/i, "").trim();
+
+  let formatted = rawMessage;
+  if (errId && !formatted.includes(String(errId))) {
+    formatted += `\n\n**Error ID:** \`${errId}\``;
+  }
+  return formatted;
+}
+
 // Convert raw CORTEX trajectory steps into a clean transcript.
 function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessage[] {
   const msgs: ChatMessage[] = [];
   const answeredArtifacts = new Set<string>();
 
-  for (const step of steps as any[]) {
+  // Filter out any reverted/deleted/undone steps from trajectory
+  const validSteps = (steps as any[]).filter((step) => {
+    if (!step) return false;
+    if (
+      step.metadata?.isReverted ||
+      step.metadata?.deleted ||
+      step.metadata?.undone ||
+      step.isDeleted ||
+      step.reverted ||
+      step.undone
+    ) {
+      return false;
+    }
+    const status = String(step.status ?? "").toUpperCase();
+    if (status === "REVERTED" || status === "DELETED" || status === "UNDONE") {
+      return false;
+    }
+    return true;
+  });
+
+  for (const step of validSteps) {
     const comments =
       step?.userInput?.artifactComments ??
       step?.artifactComments ??
@@ -1311,7 +2053,10 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
     if (Array.isArray(comments)) {
       for (const c of comments) {
         const uri = String(c?.artifactUri ?? "");
-        if (uri && c?.approvalStatus) answeredArtifacts.add(uri);
+        if (uri && c?.approvalStatus) {
+          answeredArtifacts.add(uri);
+          answeredArtifacts.add(baseName(uri));
+        }
       }
     }
   }
@@ -1319,7 +2064,7 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
   let turnTokens = 0;
   let turnDurationMs = 0;
 
-  for (const step of steps as any[]) {
+  for (const step of validSteps) {
     const type = shortType(step.type);
     const durationMs = stepDurationMs(step);
     const stepTok = stepTokenCount(step);
@@ -1327,6 +2072,8 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
 
     if (durationMs != null && durationMs > 0) turnDurationMs += durationMs;
     if (stepTok != null && stepTok > 0) turnTokens += stepTok;
+
+    const stepTs = stepTimestamp(step);
 
     if (type === "USER_INPUT") {
       // Reset turn counters when user starts a new message
@@ -1369,6 +2116,7 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
         msgs.push({
           role: "user",
           text: t,
+          ts: stepTs,
           images: images.length > 0 ? images : undefined,
           stepIndex: typeof stepIndex === "number" ? stepIndex : undefined,
         });
@@ -1378,9 +2126,32 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
     if (type === "PLANNER_RESPONSE") {
       const resp = String(step.plannerResponse?.response ?? "").trim();
       if (resp) {
+        if (isErrorLikeJson(resp)) {
+          const cleanErr = extractErrorString({ ...step, errorMessage: resp });
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.kind === "error" && lastMsg.text === cleanErr) {
+            continue;
+          }
+          msgs.push({
+            role: "assistant",
+            text: cleanErr,
+            kind: "error",
+            ts: stepTs,
+            meta: {
+              type,
+              isError: true,
+              tokens: stepTok ?? undefined,
+              turnTokens: turnTokens > 0 ? turnTokens : undefined,
+              turnDurationMs: turnDurationMs > 0 ? turnDurationMs : undefined,
+            },
+          });
+          continue;
+        }
+
         msgs.push({
           role: "assistant",
           text: resp,
+          ts: stepTs,
           meta: {
             type,
             tokens: stepTok ?? undefined,
@@ -1389,71 +2160,66 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
           },
         });
       }
-      const calls = step.plannerResponse?.toolCalls;
-      if (Array.isArray(calls)) {
-        for (const tc of calls) {
-          const toolName = String(tc?.name || "").toLowerCase();
-          if (toolName === "ask_permission" || toolName === "ask_question") {
-            try {
-              const args = typeof tc?.argumentsJson === "string" ? JSON.parse(tc.argumentsJson) : (tc?.args || {});
-              const targetPath = args.Target || args.path || args.target || args.AbsolutePath || "";
-              const actionType = args.Action || args.action || "read access";
-              const questions = [{
-                question: args.question || args.Reason || `Allow ${actionType} to this path?`,
-                description: targetPath,
-                options: Array.isArray(args.options)
-                  ? args.options.map((o: any, idx: number) => typeof o === "string" ? { id: String(idx + 1), text: o } : o)
-                  : [
-                      { id: "1", text: "Yes, allow this time" },
-                      { id: "2", text: "Yes, and always allow" },
-                      { id: "3", text: "No (tell the agent what to do instead)" }
-                    ]
-              }];
-              const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? step.stepIndex ?? step.step_index;
-              msgs.push({
-                role: "ask",
-                text: questions.map((q: any) => String(q?.question ?? "")).join("\n"),
-                stepIndex: typeof stepIndex === "number" ? stepIndex : undefined,
-                meta: {
-                  type: "ASK_PERMISSION",
-                  questions,
-                  answered: false,
-                  selected: [],
-                },
-              });
-              continue;
-            } catch {}
-          }
-
-          const fakeStep = {
-            type: `CORTEX_STEP_TYPE_${String(tc?.name || "").toUpperCase()}`,
-            plannerResponse: { toolCalls: [tc] },
-          };
-          const info = toolInfo(fakeStep);
-          const callOut = stepDetailText(fakeStep) || JSON.stringify(tc?.argumentsJson ? JSON.parse(tc.argumentsJson) : {}, null, 2);
-          msgs.push({
-            role: "tool",
-            text: `${info.verb}${info.detail ? " " + info.detail : ""}`,
-            kind: info.kind,
-            detail: info.detail,
-            meta: {
-              type,
-              output: callOut,
-              ...(stepTok != null ? { tokens: stepTok } : {}),
-            },
-          });
-        }
-      }
       continue;
     }
 
-    if (type === "SYSTEM_MESSAGE" || type === "ERROR_MESSAGE") {
+    const isError =
+      type === "ERROR_MESSAGE" ||
+      type === "FAILURE" ||
+      String(step.status ?? "").toUpperCase() === "ERROR" ||
+      String(step.status ?? "").toUpperCase() === "FAILED" ||
+      Boolean(step.errorMessage) ||
+      Boolean(step.error);
+
+    if (isError && type !== "USER_INPUT") {
+      const errText = extractErrorString(step);
+      if (errText) {
+        // Deduplicate: Don't push consecutive identical error messages
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg && lastMsg.kind === "error" && lastMsg.text === errText) {
+          continue;
+        }
+        msgs.push({
+          role: "assistant",
+          text: errText,
+          kind: "error",
+          ts: stepTs,
+          meta: { type: "ERROR_MESSAGE", isError: true, output: stepOut || undefined },
+        });
+        continue;
+      }
+    }
+
+    if (type === "SYSTEM_MESSAGE") {
       const t = String(
         step.systemMessage?.message ??
           step.systemMessage?.renderInfo?.title ??
           ""
       ).trim();
-      if (t) msgs.push({ role: "system", text: t, kind: type === "ERROR_MESSAGE" ? "error" : "system", meta: { type } });
+      if (t) {
+        if (isErrorLikeJson(t)) {
+          const cleanErr = extractErrorString({ ...step, errorMessage: t });
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.kind === "error" && lastMsg.text === cleanErr) {
+            continue;
+          }
+          msgs.push({
+            role: "assistant",
+            text: cleanErr,
+            kind: "error",
+            ts: stepTs,
+            meta: { type, isError: true },
+          });
+          continue;
+        }
+        msgs.push({
+          role: "system",
+          text: t,
+          kind: "system",
+          ts: stepTs,
+          meta: { type },
+        });
+      }
       continue;
     }
 
@@ -1472,99 +2238,44 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
 
     if (isAskStep) {
       const lastMsg = msgs[msgs.length - 1];
-      const ri = step.requestedInteraction || step.permissionRequest || step.requestedPermission || step.toolPermissionRequest || {};
-      const aq = step.askQuestion || ri.askQuestion || step.askPermission || ri.askPermission || step.permissionRequest || step.requestedPermission || step.toolPermissionRequest || ri.toolPermissionRequest || ri.permissionRequest || ri;
+      const questions = parseAskQuestions(step);
 
-      // Deep scan step object recursively for any target / path / file / resource string
-      let targetPath = "";
-      const scanObj = (o: any, depth = 0) => {
-        if (!o || typeof o !== "object" || depth > 5) return;
-        if (!targetPath) {
-          const found = o.targetPath || o.target || o.path || o.resource || o.file || o.filePath || o.Target || o.TargetFile || o.Path || o.Resource || o.uri || "";
-          if (found && typeof found === "string" && found.length > 1) {
-            targetPath = found;
-            return;
-          }
-        }
-        for (const k of Object.keys(o)) {
-          if (o[k] && typeof o[k] === "object" && k !== "options" && k !== "questions" && k !== "plannerResponse") {
-            scanObj(o[k], depth + 1);
-            if (targetPath) return;
-          }
-        }
-      };
-      scanObj(step);
-
-      let actionType = ri.permissionType || ri.action || aq.action || aq.permissionType || "read access";
-      let reasonText = aq.reason || aq.question || aq.title || ri.reason || "";
-
-      // Deduplicate: If an ask card with generic reason and no targetPath comes right after another ask card, skip duplicate!
-      if (!targetPath && (!reasonText || reasonText.toLowerCase().includes("allow read access")) && lastMsg && lastMsg.role === "ask") {
+      // Deduplicate: If an ask card with generic reason comes right after another ask card, skip duplicate
+      const qFirst = String(questions[0]?.question || "");
+      if (
+        qFirst.toLowerCase().includes("allow read access") &&
+        lastMsg &&
+        lastMsg.role === "ask"
+      ) {
         continue;
-      }
-
-      if (!reasonText) {
-        reasonText = targetPath ? `Cấp quyền truy cập cho tệp tin / thư mục:` : `Allow ${actionType} to this path?`;
-      }
-
-      let questions: any[] = [];
-      if (Array.isArray(aq?.questions) && aq.questions.length > 0) {
-        questions = aq.questions.map((q: any) => ({
-          ...q,
-          description: q.description || q.targetPath || q.target || q.path || targetPath
-        }));
-      } else {
-        questions = [{
-          question: reasonText,
-          description: targetPath,
-          options: [
-            { id: "1", text: "Yes, allow this time" },
-            { id: "2", text: "Yes, and always allow" },
-            { id: "3", text: "No (tell the agent what to do instead)" }
-          ]
-        }];
-      }
-
-      if (questions.length === 0 && step.plannerResponse?.toolCalls) {
-        for (const tc of step.plannerResponse.toolCalls) {
-          if (tc.name === "ask_permission" || tc.name === "ask_question") {
-            try {
-              const args = tc.argumentsJson ? JSON.parse(tc.argumentsJson) : (tc.args || {});
-              const targetPath = args.Target || args.path || args.target || "";
-              const actionType = args.Action || args.action || "read access";
-              questions = [{
-                question: args.question || args.Reason || `Allow ${actionType} to this path?`,
-                description: targetPath,
-                options: Array.isArray(args.options)
-                  ? args.options.map((o: any, idx: number) => typeof o === "string" ? { id: String(idx + 1), text: o } : o)
-                  : [
-                      { id: "1", text: "Yes, allow this time" },
-                      { id: "2", text: "Yes, and always allow" },
-                      { id: "3", text: "No (tell the agent what to do instead)" }
-                    ]
-              }];
-            } catch {}
-          }
-        }
       }
 
       if (questions.length > 0) {
         const answered =
-          Array.isArray(step.completedInteractions) && step.completedInteractions.length > 0
+          Array.isArray(step.completedInteractions) &&
+          step.completedInteractions.length > 0
             ? true
             : questions.some(
                 (q: any) =>
                   q?.skipped === true ||
-                  (Array.isArray(q?.selectedOptionIds) && q.selectedOptionIds.length > 0)
+                  (Array.isArray(q?.selectedOptionIds) &&
+                    q.selectedOptionIds.length > 0)
               );
-        const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? step.stepIndex ?? step.step_index;
+        const stepIndex =
+          step.metadata?.sourceTrajectoryStepInfo?.stepIndex ??
+          step.stepIndex ??
+          step.step_index;
         const selected: string[] = [];
         for (const q of questions) {
-          if (Array.isArray(q?.selectedOptionIds)) selected.push(...q.selectedOptionIds);
+          if (Array.isArray(q?.selectedOptionIds))
+            selected.push(...q.selectedOptionIds);
         }
         msgs.push({
           role: "ask",
-          text: questions.map((q: any) => String(q?.question ?? "")).join("\n"),
+          text: questions
+            .map((q: any) => String(q?.question ?? ""))
+            .join("\n"),
+          ts: stepTs,
           stepIndex: typeof stepIndex === "number" ? stepIndex : undefined,
           meta: {
             type,
@@ -1587,21 +2298,36 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
       continue;
     }
 
-    if (type === "CODE_ACTION" && isPlanStep(step)) {
+    if ((type === "CODE_ACTION" || type === "WRITE_TO_FILE") && isPlanStep(step)) {
       const args = toolArgs(step);
       const spec = step?.codeAction?.actionSpec?.createFile;
+      const targetFile = String(
+        args.TargetFile || args.AbsolutePath || spec?.path?.absoluteUri || ""
+      );
       const body = String(
-        spec?.instruction || args.CodeContent || args?.ArtifactMetadata?.Summary || ""
+        args.CodeContent ||
+          spec?.instruction ||
+          args?.ArtifactMetadata?.Summary ||
+          step.content ||
+          ""
       ).trim();
-      const artifactUri = String(spec?.path?.absoluteUri ?? "");
+      const artifactUri = targetFile.startsWith("file://")
+        ? targetFile
+        : targetFile
+        ? `file://${targetFile}`
+        : "";
       const answered =
-        (artifactUri && answeredArtifacts.has(artifactUri)) ||
+        (artifactUri && (
+          answeredArtifacts.has(artifactUri) ||
+          answeredArtifacts.has(baseName(artifactUri))
+        )) ||
         (Array.isArray(step?.completedInteractions) &&
           step.completedInteractions.length > 0);
       if (body) {
         msgs.push({
           role: "plan",
           text: body,
+          ts: stepTs,
           meta: { type, artifactUri, answered },
         });
         continue;
@@ -1616,6 +2342,7 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
         msgs.push({
           role: "artifact",
           text: name,
+          ts: stepTs,
           meta: { type, artifactUri: uri },
         });
         continue;
@@ -1638,6 +2365,7 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
         text: `${info.verb}${info.detail ? " " + info.detail : ""}`,
         kind: info.kind,
         detail: stepOut || info.detail,
+        ts: stepTs,
         meta: {
           type,
           ...(durationMs != null ? { durationMs } : {}),
@@ -1649,7 +2377,26 @@ function stepsToMessages(steps: TrajectoryStep[], cascadeId?: string): ChatMessa
       });
     }
   }
-  return msgs;
+
+  // Final deduplication pass: collapse consecutive error bubbles into a single clean message
+  const finalMsgs: ChatMessage[] = [];
+  for (const m of msgs) {
+    const prev = finalMsgs[finalMsgs.length - 1];
+    if (
+      prev &&
+      m.kind === "error" &&
+      prev.kind === "error"
+    ) {
+      // If one has more details / text, keep the better one
+      if ((!prev.text || prev.text.length < m.text.length) && m.text) {
+        finalMsgs[finalMsgs.length - 1] = m;
+      }
+      continue;
+    }
+    finalMsgs.push(m);
+  }
+
+  return finalMsgs;
 }
 
 function titleCase(s: string): string {

@@ -5,7 +5,7 @@
 // (file:///…) are clickable and open in the Files tab. Everything is escaped
 // first so it is safe to render.
 
-import { useState } from "react";
+import React, { useState, memo } from "react";
 import { Icon } from "./Icon";
 import hljs from "highlight.js/lib/common";
 
@@ -226,17 +226,28 @@ function renderHtmlBlock(src: string): string {
   return html.join("\n");
 }
 
-function CodeBlock({ lang, content }: { lang?: string; content: string }) {
+const CodeBlock = memo(function CodeBlock({
+  lang,
+  content,
+  onRunTerminal,
+}: {
+  lang: string;
+  content: string;
+  onRunTerminal?: (cmd: string) => void;
+}) {
   const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    } catch {
-      /* ignore */
-    }
+  const [showLineNumbers, setShowLineNumbers] = useState(false);
+  const [wordWrap, setWordWrap] = useState(false);
+
+  const copy = () => {
+    navigator.clipboard?.writeText(content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
+
+  const isShell = /^(bash|sh|zsh|shell|terminal|cmd|powershell)$/i.test(lang.trim());
+  const lines = content.split("\n");
+
   // Syntax highlight (best-effort). Fall back to escaped plain text.
   let html = "";
   try {
@@ -248,33 +259,83 @@ function CodeBlock({ lang, content }: { lang?: string; content: string }) {
   } catch {
     html = escapeHtml(content);
   }
+
   return (
-    <div className="code-block">
+    <div className={"code-block" + (wordWrap ? " word-wrap" : "")}>
       <div className="code-head">
-        <span className="code-lang">{lang || "code"}</span>
-        <button className="code-copy" onClick={copy} title="Copy">
-          <Icon name={copied ? "check" : "file"} size={13} />
-          <span>{copied ? "Copied" : "Copy"}</span>
-        </button>
+        <div className="code-head-left">
+          <Icon name="code" size={13} />
+          <span className="code-lang">{lang || "code"}</span>
+          <span className="code-line-count">{lines.length} dòng</span>
+        </div>
+        <div className="code-actions">
+          {isShell && onRunTerminal && (
+            <button
+              type="button"
+              className="code-action-btn run-btn"
+              onClick={() => onRunTerminal(content)}
+              title="Chạy lệnh này trong Terminal"
+            >
+              <Icon name="play" size={12} />
+              <span>Chạy Terminal</span>
+            </button>
+          )}
+          <button
+            type="button"
+            className={"code-action-btn" + (showLineNumbers ? " active" : "")}
+            onClick={() => setShowLineNumbers(!showLineNumbers)}
+            title="Bật/tắt số dòng"
+          >
+            <span># Số dòng</span>
+          </button>
+          <button
+            type="button"
+            className={"code-action-btn" + (wordWrap ? " active" : "")}
+            onClick={() => setWordWrap(!wordWrap)}
+            title="Bật/tắt ngắt dòng (Word Wrap)"
+          >
+            <span>Tự ngắt dòng</span>
+          </button>
+          <button
+            type="button"
+            className="code-copy"
+            onClick={copy}
+            title="Sao chép toàn bộ mã nguồn"
+          >
+            <Icon name={copied ? "check" : "copy"} size={13} />
+            <span>{copied ? "Đã chép" : "Sao chép"}</span>
+          </button>
+        </div>
       </div>
-      <pre>
-        <code
-          className="hljs"
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
-      </pre>
+      <div className="code-content-wrapper">
+        {showLineNumbers && (
+          <div className="code-line-numbers" aria-hidden="true">
+            {lines.map((_, i) => (
+              <span key={i}>{i + 1}</span>
+            ))}
+          </div>
+        )}
+        <pre className="code-pre">
+          <code
+            className="hljs"
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        </pre>
+      </div>
     </div>
   );
-}
+});
 
-export function Markdown({
+export const Markdown = memo(function Markdown({
   text,
   onOpenFile,
   onPreviewImage,
+  onRunTerminal,
 }: {
   text: string;
   onOpenFile?: (path: string) => void;
   onPreviewImage?: (src: string) => void;
+  onRunTerminal?: (cmd: string) => void;
 }) {
   const blocks = parseBlocks(text);
   // Intercept clicks on file links and image previews
@@ -297,11 +358,16 @@ export function Markdown({
     <div className="markdown" onClick={onClick}>
       {blocks.map((b, i) =>
         b.type === "code" ? (
-          <CodeBlock key={i} lang={b.lang} content={b.content} />
+          <CodeBlock
+            key={i}
+            lang={b.lang || ""}
+            content={b.content}
+            onRunTerminal={onRunTerminal}
+          />
         ) : (
           <div key={i} dangerouslySetInnerHTML={{ __html: b.content }} />
         )
       )}
     </div>
   );
-}
+});

@@ -33,6 +33,7 @@ export interface RemoteSettings {
   telegramEnabled: boolean;
   telegramToken: string;
   telegramChatId: string;
+  telegramNotifyOnComplete: boolean;
   workspaceRoot: string; // folder that contains the user's project folders
 }
 
@@ -45,6 +46,7 @@ const EDITABLE_KEYS: Array<keyof RemoteSettings> = [
   "telegramEnabled",
   "telegramToken",
   "telegramChatId",
+  "telegramNotifyOnComplete",
   "workspaceRoot",
 ];
 
@@ -131,6 +133,28 @@ export const SettingsController = {
         lastUsed: numOr(a?.last_used) || undefined,
         quota,
       };
+    });
+
+    const isProTier = (tier?: string) => {
+      if (!tier) return false;
+      const t = tier.toUpperCase();
+      return (
+        t.includes("PRO") ||
+        t.includes("PLUS") ||
+        t.includes("ULTRA") ||
+        t.includes("PREMIUM") ||
+        t.includes("PAID") ||
+        t.includes("ENTERPRISE") ||
+        t.includes("ADVANCED")
+      );
+    };
+
+    accounts.sort((a, b) => {
+      const aPro = isProTier(a.tier);
+      const bPro = isProTier(b.tier);
+      if (aPro !== bPro) return aPro ? -1 : 1;
+      if (a.current !== b.current) return a.current ? -1 : 1;
+      return (a.name || a.email).localeCompare(b.name || b.email);
     });
 
     return { currentEmail, accounts };
@@ -266,6 +290,7 @@ export const SettingsController = {
       telegramEnabled: c.get<boolean>("telegramEnabled", false),
       telegramToken: c.get<string>("telegramToken", ""),
       telegramChatId: c.get<string>("telegramChatId", ""),
+      telegramNotifyOnComplete: c.get<boolean>("telegramNotifyOnComplete", true),
       workspaceRoot: c.get<string>("workspaceRoot", ""),
     };
   },

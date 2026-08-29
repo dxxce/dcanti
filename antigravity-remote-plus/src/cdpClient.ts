@@ -480,4 +480,182 @@ export class CdpClient {
       return false;
     }
   }
+
+  /**
+   * Switch/open a conversation by ID in the IDE webview/DOM.
+   */
+  async openConversation(conversationId: string): Promise<boolean> {
+    if (!conversationId || !(await this.ensure())) return false;
+    const json = JSON.stringify(conversationId);
+    const expr = `(() => {
+      const id = ${json};
+      function searchAndClick(root) {
+        if (!root) return false;
+        try {
+          const el = root.querySelector(\`[data-cascade-id="\${id}"], [data-conversation-id="\${id}"], [data-id="\${id}"]\`);
+          if (el) {
+            (el).click();
+            return true;
+          }
+          const links = Array.from(root.querySelectorAll('a, button, div, span, [role="treeitem"], [role="listitem"]'));
+          for (const l of links) {
+            const href = l.getAttribute('href') || '';
+            const key = l.getAttribute('data-key') || '';
+            const title = l.getAttribute('title') || '';
+            if (href.includes(id) || key.includes(id) || title.includes(id)) {
+              (l).click();
+              return true;
+            }
+          }
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc && searchAndClick(doc)) return true;
+          } catch {}
+        }
+        return false;
+      }
+      return searchAndClick(document);
+    })()`;
+    try {
+      return await this.session!.evaluate<boolean>(expr);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Click revert button for a specific step in the IDE DOM.
+   */
+  async revertToStep(stepIndex: number): Promise<boolean> {
+    if (stepIndex == null || !(await this.ensure())) return false;
+    const expr = `(() => {
+      const target = ${stepIndex};
+      function searchAndClick(root) {
+        if (!root) return false;
+        try {
+          const btns = Array.from(root.querySelectorAll('button, [role="button"], [data-step-index], [data-index]'));
+          for (const b of btns) {
+            const stepAttr = b.getAttribute('data-step-index') || b.getAttribute('data-index') || '';
+            const t = (b.textContent || b.getAttribute('title') || b.getAttribute('aria-label') || '').toLowerCase();
+            if ((t.includes('revert') || t.includes('quay lại')) && (stepAttr === String(target) || !stepAttr)) {
+              (b).click();
+              return true;
+            }
+          }
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc && searchAndClick(doc)) return true;
+          } catch {}
+        }
+        return false;
+      }
+      return searchAndClick(document);
+    })()`;
+    try {
+      return await this.session!.evaluate<boolean>(expr);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Answer or skip an interactive question directly inside the IDE DOM.
+   */
+  async answerQuestion(options?: {
+    optionIndices?: number[];
+    freeText?: string;
+    isSkip?: boolean;
+  }): Promise<boolean> {
+    if (!(await this.ensure())) return false;
+    const json = JSON.stringify(options || {});
+    const expr = `(() => {
+      const opts = ${json};
+      function searchAll(root) {
+        if (!root) return [];
+        let res = [];
+        try {
+          res.push(...Array.from(root.querySelectorAll('button, [role="button"], input, textarea, .interactive-card, [data-testid]')));
+        } catch {}
+        const iframes = root.querySelectorAll('iframe, webview');
+        for (const f of iframes) {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (doc) res.push(...searchAll(doc));
+          } catch {}
+        }
+        return res;
+      }
+
+      const elements = searchAll(document);
+      const norm = (s) => (s || '').toLowerCase().trim();
+
+      if (opts.isSkip) {
+        const skipBtn = elements.find(el => {
+          const t = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (t === 'skip' || t.includes('skip') || t.includes('bỏ qua'));
+        });
+        if (skipBtn) {
+          try { (skipBtn).click(); return true; } catch {}
+        }
+      }
+
+      if (opts.freeText) {
+        const input = elements.find(el => {
+          return (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (
+            norm(el.placeholder).includes('type') ||
+            norm(el.placeholder).includes('nhập') ||
+            norm(el.placeholder).includes('other') ||
+            norm(el.placeholder).includes('answer')
+          );
+        });
+        if (input) {
+          try {
+            (input).focus();
+            (input).value = opts.freeText;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch {}
+        }
+      }
+
+      if (Array.isArray(opts.optionIndices) && opts.optionIndices.length > 0) {
+        const optionBtns = elements.filter(el => {
+          const cl = norm(el.className);
+          const t = norm(el.innerText || el.textContent);
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (cl.includes('option') || cl.includes('choice') || /^[0-9]\\b/.test(t));
+        });
+        for (const idx of opts.optionIndices) {
+          const target = optionBtns[idx] || optionBtns.find(b => norm(b.innerText).startsWith(String(idx + 1)));
+          if (target) {
+            try { (target).click(); } catch {}
+          }
+        }
+      }
+
+      // Finally find and click "Submit" button
+      if (!opts.isSkip) {
+        const submitBtn = elements.find(el => {
+          const t = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+          return (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && (t === 'submit' || t.includes('submit') || t.includes('gửi'));
+        });
+        if (submitBtn) {
+          try { (submitBtn).click(); return true; } catch {}
+        }
+      }
+
+      return false;
+    })()`;
+    try {
+      return await this.session!.evaluate<boolean>(expr);
+    } catch (e) {
+      this.log(`[cdp] answerQuestion failed: ${(e as Error).message}`);
+      return false;
+    }
+  }
 }
